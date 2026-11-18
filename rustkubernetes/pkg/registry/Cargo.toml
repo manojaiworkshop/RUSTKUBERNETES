@@ -1,0 +1,24 @@
+[package]
+name = "kube-registry"
+description = "Port of k8s.io/kubernetes/pkg/registry: REST strategies for built-in resources, ClusterIP/NodePort allocators"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+k8s-api.workspace = true
+k8s-apimachinery.workspace = true
+k8s-apiserver.workspace = true
+kube-apis.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+kube-serviceaccount.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true

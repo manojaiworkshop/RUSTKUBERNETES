@@ -1,0 +1,88 @@
+# A small multi-tier app used by hack/test-cmd.sh and the README.
+# Phase 1 stores and validates everything; pods start running once the
+# controller-manager (phase 2), scheduler (phase 3) and kubelet (phase 4) exist.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: guestbook
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-config
+  namespace: guestbook
+data:
+  GET_HOSTS_FROM: dns
+  BACKEND: redis-leader
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-leader
+  namespace: guestbook
+  labels: {app: redis, role: leader, tier: backend}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: redis, role: leader}
+  template:
+    metadata:
+      labels: {app: redis, role: leader, tier: backend}
+    spec:
+      containers:
+      - name: leader
+        image: redis:7.4
+        resources:
+          requests: {cpu: 100m, memory: 100Mi}
+        ports:
+        - containerPort: 6379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-leader
+  namespace: guestbook
+spec:
+  selector: {app: redis, role: leader}
+  ports:
+  - port: 6379
+    targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: guestbook
+  labels: {app: guestbook, tier: frontend}
+spec:
+  replicas: 3
+  selector:
+    matchLabels: {app: guestbook, tier: frontend}
+  template:
+    metadata:
+      labels: {app: guestbook, tier: frontend}
+    spec:
+      containers:
+      - name: php-redis
+        image: us-docker.pkg.dev/google-samples/containers/gke/gb-frontend:v5
+        envFrom:
+        - configMapRef: {name: frontend-config}
+        resources:
+          requests: {cpu: 100m, memory: 100Mi}
+        ports:
+        - containerPort: 80
+        readinessProbe:
+          httpGet: {path: /, port: 80}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: guestbook
+  labels: {app: guestbook, tier: frontend}
+spec:
+  type: NodePort
+  selector: {app: guestbook, tier: frontend}
+  ports:
+  - port: 80
+    targetPort: 80

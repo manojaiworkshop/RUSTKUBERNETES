@@ -1,0 +1,47 @@
+Phase 6 was too large to do in one go, so I split it into four parts. The first two are now done: 6a (security) and 6b (cluster DNS). Everything passes: 120 unit/integration tests, 39/39 kubectl command tests, and 59/59 end-to-end checks against a real secure cluster. fmt and clippy are clean, and no test processes, containers or firewall rules were left behind.
+
+Security (6a)
+Certificates: a new kubeadm tool creates the cluster CA, a certificate for each component, and kubeconfigs (admin.conf, kubelet.conf, …). kubeadm kubeconfig user --client-name jane --org dev makes a login for a new user.
+API server: now HTTPS only. You log in with a client certificate, a static token, or a ServiceAccount token; with nothing, you're anonymous and can only read health endpoints. Each component uses its own identity.
+RBAC:
+Ships with the standard default roles (cluster-admin, admin, edit, view, …).
+Users cannot grant permissions they don't already hold.
+kubectl auth can-i (including --list), auth whoami, --as impersonation and create role/rolebinding all work.
+Error messages match upstream Kubernetes exactly.
+ServiceAccount tokens:
+kubectl create token works.
+Every pod automatically gets a token, the CA certificate and its namespace mounted in.
+The kubelet renews the token before it expires.
+Deleting the pod or the ServiceAccount invalidates its tokens immediately.
+Kubelet: its API was previously open to anyone; it now requires HTTPS plus a login, and checks permissions with the API server. kubectl logs/exec reach it over TLS.
+Cluster DNS (6b)
+The real CoreDNS image runs as an add-on at 10.96.0.10. Pods get proper DNS settings, so web, web.default.svc.cluster.local and external names all resolve. CoreDNS itself is a real Kubernetes client: it talks to our API server from inside the cluster with its own token, under RBAC. That makes it a good proof that all of 6a works together.
+
+Bugs found and fixed
+RBAC role names like system:node were rejected, because names were checked as DNS names. Fixed with a per-resource name check, as upstream does.
+Plain-HTTP tools (scheduler, kubemark, rkubectl, tests) crashed at startup. The HTTP library now needs a crypto provider even without TLS; it's installed everywhere now.
+The e2e test occasionally failed when its random port was already in use. It now picks a free range of ports.
+What changed for you
+hack/local-up-cluster.sh now starts a secure cluster by default. The API server listens on https://172.17.0.1:6443 (the Docker bridge address, so pods can reach it), and _output/local/kubeconfig is the admin login. SECURE=0 gives the old insecure HTTP mode. Commands to try are in the new "3c. Security and DNS" section of docs/testing-guide.md; the design is in docs/phase-6-security.md.
+
+Still not done
+No per-node permission limits yet: a kubelet's credentials can read every Secret in the cluster.
+No certificate rotation or certificate-request API; certificates last 1 year.
+No audit logging.
+system:kube-controller-manager has full access, because the controller manager runs under a single identity rather than one per controller.
+Next is 6c: swapping our in-memory store for real etcd behind the existing storage interface. After that, 6d: containerd, kubectl explain, metrics and audit.
+-----------------------------------------------------------------------------------
+
+
+
+hack/local-up-cluster.sh            # the first run builds the kube-proxy image (~40s)
+kubectl create deploy hello --image=nginx:1.27-alpine --replicas=3
+kubectl expose deploy hello --port=80 --type=NodePort
+curl http://$(kubectl get svc hello -o jsonpath='{.spec.clusterIP}')
+
+
+
+cd ~/Documents/KUBERNETES/rustkubernetes
+make admin
+export RUSTKUBEADMIN_USER=admin RUSTKUBEADMIN_PASSWORD='manoj123'
+make run-admin              # http://127.0.0.1:8090

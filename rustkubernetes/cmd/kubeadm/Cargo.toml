@@ -1,0 +1,23 @@
+[package]
+name = "kubeadm"
+description = "Cluster bootstrap tool (Rust port, certificate and kubeconfig phases)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kubeadm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+rcgen = { workspace = true, features = ["x509-parser"] }
+
+[dev-dependencies]
+k8s-client-go.workspace = true
+x509-parser = { workspace = true, features = ["verify"] }
+
+[lints]
+workspace = true

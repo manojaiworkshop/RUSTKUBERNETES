@@ -1,0 +1,17 @@
+[package]
+name = "k8s-apimachinery"
+description = "Rust port of k8s.io/apimachinery: meta types, errors, selectors, validation helpers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_with.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

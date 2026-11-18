@@ -1,0 +1,23 @@
+[package]
+name = "kubelet"
+description = "The Kubernetes node agent (Rust port)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kubelet"
+path = "src/main.rs"
+
+[dependencies]
+k8s-api.workspace = true
+k8s-client-go.workspace = true
+kube-kubelet.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

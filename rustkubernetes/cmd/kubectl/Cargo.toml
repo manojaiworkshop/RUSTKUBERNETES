@@ -1,0 +1,25 @@
+[package]
+name = "rkubectl"
+description = "kubectl controls the Kubernetes cluster manager (Rust port)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rkubectl"
+path = "src/main.rs"
+
+[dependencies]
+k8s-apimachinery.workspace = true
+k8s-client-go.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+tokio.workspace = true
+libc = "0.2"
+
+[lints]
+workspace = true

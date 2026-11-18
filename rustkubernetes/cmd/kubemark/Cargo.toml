@@ -1,0 +1,22 @@
+[package]
+name = "kubemark"
+description = "Hollow nodes for testing a rustkubernetes control plane without real kubelets"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kubemark"
+path = "src/main.rs"
+
+[dependencies]
+k8s-client-go.workspace = true
+kube-kubemark.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

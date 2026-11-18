@@ -1,0 +1,19 @@
+[package]
+name = "kube-kubemark"
+description = "Port of k8s.io/kubernetes/pkg/kubemark: hollow nodes that act like kubelets without running containers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+k8s-api.workspace = true
+k8s-apimachinery.workspace = true
+k8s-client-go.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,23 @@
+[package]
+name = "kube-proxy"
+description = "The Kubernetes network proxy (Rust port, nftables mode)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kube-proxy"
+path = "src/main.rs"
+
+[dependencies]
+k8s-client-go.workspace = true
+kube-proxy-core.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "kube-scheduler"
+description = "The Kubernetes scheduler (Rust port)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kube-scheduler"
+path = "src/main.rs"
+
+[dependencies]
+k8s-client-go.workspace = true
+kube-scheduler-core.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

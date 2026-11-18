@@ -1,0 +1,101 @@
+[workspace]
+resolver = "2"
+members = [
+    # staging: libraries mirrored from k8s.io/* modules
+    "staging/src/k8s.io/apimachinery",
+    "staging/src/k8s.io/api",
+    "staging/src/k8s.io/apiserver",
+    "staging/src/k8s.io/client-go",
+    # core implementation (k8s.io/kubernetes/pkg)
+    "pkg/apis",
+    "pkg/registry",
+    "pkg/controlplane",
+    "pkg/controller",
+    "pkg/scheduler",
+    "pkg/kubemark",
+    "pkg/kubelet",
+    "pkg/proxy",
+    "pkg/serviceaccount",
+    # admission / auth plugins (k8s.io/kubernetes/plugin)
+    "plugin",
+    # binaries
+    "cmd/kube-apiserver",
+    "cmd/kube-controller-manager",
+    "cmd/kube-scheduler",
+    "cmd/kubemark",
+    "cmd/kubelet",
+    "cmd/kube-proxy",
+    "cmd/kubeadm",
+    "cmd/kubectl",
+    # web console (rustkubeadmin)
+    "admin",
+    # tests
+    "test/integration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# internal crates
+k8s-apimachinery = { path = "staging/src/k8s.io/apimachinery" }
+k8s-api = { path = "staging/src/k8s.io/api" }
+k8s-apiserver = { path = "staging/src/k8s.io/apiserver" }
+k8s-client-go = { path = "staging/src/k8s.io/client-go" }
+kube-apis = { path = "pkg/apis" }
+kube-registry = { path = "pkg/registry" }
+kube-controlplane = { path = "pkg/controlplane" }
+kube-controller = { path = "pkg/controller" }
+kube-scheduler-core = { path = "pkg/scheduler" }
+kube-kubemark = { path = "pkg/kubemark" }
+kube-kubelet = { path = "pkg/kubelet" }
+kube-proxy-core = { path = "pkg/proxy" }
+kube-serviceaccount = { path = "pkg/serviceaccount" }
+kube-plugin = { path = "plugin" }
+
+# external crates
+anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+form_urlencoded = "1"
+futures = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+libc = "0.2"
+json-patch = "5"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "query", "rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+jsonwebtoken = "9"
+x509-parser = "0.18"
+tower = { version = "0.5", features = ["util"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_with = "3"
+serde_yaml = "0.9"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = "0.29"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.dev]
+# keep debug builds small: the disk on this machine is nearly full
+debug = 1
+
+[workspace.lints.clippy]
+# ApiError carries a full Status (details + causes); boxing it everywhere hurts readability.
+result_large_err = "allow"
