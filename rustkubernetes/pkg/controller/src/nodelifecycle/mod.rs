@@ -12,6 +12,11 @@
 //! | `Unknown` | `node.kubernetes.io/unreachable` | `node.kubernetes.io/unreachable` |
 //! | `spec.unschedulable` | — | `node.kubernetes.io/unschedulable` |
 //!
+//! Other conditions map to `NoSchedule` taints (`TaintNodesByCondition`):
+//! `MemoryPressure`, `DiskPressure`, `PIDPressure` and `NetworkUnavailable`
+//! set to `True` give `node.kubernetes.io/memory-pressure`, `disk-pressure`,
+//! `pid-pressure` and `network-unavailable`.
+//!
 //! **Taint eviction**: pods on a node with `NoExecute` taints they do not
 //! tolerate are deleted; tolerations with `tolerationSeconds` delay the
 //! eviction until `taint.timeAdded + tolerationSeconds`.
@@ -36,7 +41,26 @@ use crate::ControllerContext;
 pub const TAINT_NOT_READY: &str = "node.kubernetes.io/not-ready";
 pub const TAINT_UNREACHABLE: &str = "node.kubernetes.io/unreachable";
 pub const TAINT_UNSCHEDULABLE: &str = "node.kubernetes.io/unschedulable";
-const MANAGED: &[&str] = &[TAINT_NOT_READY, TAINT_UNREACHABLE, TAINT_UNSCHEDULABLE];
+pub const TAINT_MEMORY_PRESSURE: &str = "node.kubernetes.io/memory-pressure";
+pub const TAINT_DISK_PRESSURE: &str = "node.kubernetes.io/disk-pressure";
+pub const TAINT_PID_PRESSURE: &str = "node.kubernetes.io/pid-pressure";
+pub const TAINT_NETWORK_UNAVAILABLE: &str = "node.kubernetes.io/network-unavailable";
+const MANAGED: &[&str] = &[
+    TAINT_NOT_READY,
+    TAINT_UNREACHABLE,
+    TAINT_UNSCHEDULABLE,
+    TAINT_MEMORY_PRESSURE,
+    TAINT_DISK_PRESSURE,
+    TAINT_PID_PRESSURE,
+    TAINT_NETWORK_UNAVAILABLE,
+];
+/// `nodeConditionToTaintKeyStatusMap` (besides Ready).
+const CONDITION_TAINTS: &[(&str, &str)] = &[
+    ("MemoryPressure", TAINT_MEMORY_PRESSURE),
+    ("DiskPressure", TAINT_DISK_PRESSURE),
+    ("PIDPressure", TAINT_PID_PRESSURE),
+    ("NetworkUnavailable", TAINT_NETWORK_UNAVAILABLE),
+];
 const NODE_LEASE_NAMESPACE: &str = "kube-node-lease";
 
 pub struct Controller {
@@ -147,6 +171,12 @@ impl Controller {
         }
         if unschedulable {
             desired.push((TAINT_UNSCHEDULABLE, "NoSchedule"));
+        }
+        let conds = node.status.as_ref().and_then(|s| s.conditions.clone()).unwrap_or_default();
+        for (cond, taint) in CONDITION_TAINTS {
+            if conds.iter().any(|c| c.type_ == *cond && c.status == "True") {
+                desired.push((taint, "NoSchedule"));
+            }
         }
         let current = node.spec.as_ref().and_then(|s| s.taints.clone()).unwrap_or_default();
         let have: BTreeSet<(String, String)> =

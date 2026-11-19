@@ -94,14 +94,23 @@ pub async fn run(rt: &dyn Runtime, probe: &Probe, container_id: &str, pod_ip: &s
     if let Some(h) = &probe.http_get {
         let port = resolve_port(&h.port, c).ok_or("invalid probe port")?;
         let host = h.host.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| pod_ip.to_string());
-        if h.scheme.as_deref() == Some("HTTPS") {
-            return Err("HTTPS probes are not supported yet".into());
-        }
+        // HTTPS probes do not verify the server certificate (`InsecureSkipVerify`), as upstream.
+        let scheme = if h.scheme.as_deref() == Some("HTTPS") { "https" } else { "http" };
         let path = h.path.clone().unwrap_or_else(|| "/".into());
-        let url = format!("http://{host}:{port}{}{path}", if path.starts_with('/') { "" } else { "/" });
+        let host = if host.contains(':') { format!("[{host}]") } else { host };
+        let url = format!("{scheme}://{host}:{port}{}{path}", if path.starts_with('/') { "" } else { "/" });
         k8s_client_go::util::cert::install_crypto_provider();
-        let client = reqwest::Client::builder().timeout(timeout).build().map_err(|e| e.to_string())?;
-        return match client.get(&url).header("User-Agent", "kube-probe/1.35").send().await {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .danger_accept_invalid_certs(true)
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut req = client.get(&url).header("User-Agent", "kube-probe/1.35").header("Accept", "*/*");
+        for hd in h.http_headers.iter().flatten() {
+            req = req.header(hd.name.as_str(), hd.value.as_str());
+        }
+        return match req.send().await {
             Ok(r) if (200..400).contains(&r.status().as_u16()) => Ok(()),
             Ok(r) => Err(format!("HTTP probe failed with statuscode: {}", r.status().as_u16())),
             Err(e) => Err(format!("Get \"{url}\": {e}")),

@@ -32,6 +32,7 @@ pub async fn start_test_server() -> TestServer {
     let cfg = kube_controlplane::Config { advertise_port: addr.port(), ..Default::default() };
     let server = new_server(&cfg, MemoryStore::new()).unwrap();
     bootstrap(&server, &cfg).await.unwrap();
+    k8s_apiextensions_apiserver::start(server.clone()).await;
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let srv = server.clone();
     tokio::spawn(async move {
@@ -65,6 +66,7 @@ pub fn test_controller_config() -> ControllerConfig {
         node_monitor_period: Duration::from_millis(500),
         terminated_pod_gc_threshold: 100,
         root_ca: None,
+        ..Default::default()
     }
 }
 

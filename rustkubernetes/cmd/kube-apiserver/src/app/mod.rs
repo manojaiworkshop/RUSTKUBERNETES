@@ -12,6 +12,7 @@ use k8s_apiserver::authorization::{AlwaysAllow, Attributes, Authorizer, Authoriz
 use k8s_apiserver::{MemoryStore, Storage};
 use k8s_client_go::util::cert::{self, TlsClientConfig};
 use kube_controlplane::{bootstrap, new_server, Config, ServiceAccountConfig, KUBE_VERSION};
+use kube_plugin::auth::node::NodeAuthorizer;
 use kube_plugin::auth::rbac::RbacAuthorizer;
 use kube_serviceaccount::{PublicKeys, TokenAuthenticator, TokenGenerator};
 
@@ -30,18 +31,14 @@ pub fn init_logging(v: u8) {
 
 pub async fn run(opts: ServerRunOptions) -> anyhow::Result<()> {
     tracing::info!(version = KUBE_VERSION, "starting kube-apiserver (rustkubernetes)");
-    let storage: Arc<dyn Storage> = match &opts.data_dir {
-        Some(dir) => MemoryStore::open(dir).map_err(|e| anyhow::anyhow!(e)).context("opening storage")?,
-        None => {
-            tracing::warn!("no --data-dir given: cluster state is kept in memory only");
-            MemoryStore::new()
-        }
-    };
+    let storage = open_storage(&opts).await?;
     let mut cfg = Config {
         service_cidr: opts.service_cluster_ip_range.clone(),
         node_port_range: opts.service_node_port_range.clone(),
         advertise_address: opts.advertise_address.clone(),
         advertise_port: opts.port,
+        enable_admission_plugins: opts.enable_admission_plugins.clone(),
+        disable_admission_plugins: opts.disable_admission_plugins.clone(),
         ..Default::default()
     };
     let secure = opts.tls_cert_file.is_some();
@@ -53,6 +50,21 @@ pub async fn run(opts: ServerRunOptions) -> anyhow::Result<()> {
     let server = new_server(&cfg, storage.clone()).map_err(|e| anyhow::anyhow!(e))?;
     tracing::info!(plugins = ?server.admission.names(), "admission plugins enabled");
     bootstrap(&server, &cfg).await.map_err(|e| anyhow::anyhow!(e.message))?;
+    publish_authentication_info(&server, &opts).await?;
+    let read_opt = |p: &Option<std::path::PathBuf>| -> anyhow::Result<Option<Vec<u8>>> {
+        p.as_ref().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).transpose()
+    };
+    let agg = kube_aggregator::Config {
+        proxy_client_cert: read_opt(&opts.proxy_client_cert_file)?,
+        proxy_client_key: read_opt(&opts.proxy_client_key_file)?,
+        enable_aggregator_routing: opts.enable_aggregator_routing,
+    };
+    if agg.proxy_client_cert.is_none() {
+        tracing::warn!("no --proxy-client-cert-file: extension API servers cannot authenticate this server");
+    }
+    // apiextensions-apiserver: serve established CustomResourceDefinitions.
+    k8s_apiextensions_apiserver::start(server.clone()).await;
+    kube_aggregator::KubeAggregator::start(server.clone(), agg).await;
 
     let addr: SocketAddr = format!("{}:{}", opts.bind_address, opts.port).parse().context("invalid --bind-address/--port")?;
     if secure {
@@ -149,6 +161,10 @@ async fn configure_security(opts: &ServerRunOptions, cfg: &mut Config, storage: 
         }));
         kinds.push("serviceaccount");
     }
+    if opts.enable_bootstrap_token_auth {
+        authenticators.push(Arc::new(kube_plugin::auth::bootstrap::BootstrapTokenAuthenticator { storage: storage.clone() }));
+        kinds.push("bootstrap-token");
+    }
     authenticators.push(Arc::new(RejectUnknownBearer));
     if opts.anonymous_auth {
         kinds.push("anonymous");
@@ -164,7 +180,7 @@ async fn configure_security(opts: &ServerRunOptions, cfg: &mut Config, storage: 
             "RBAC" => chain.push(RbacAuthorizer::start(storage.clone()).await),
             "AlwaysAllow" => chain.push(Arc::new(AlwaysAllow)),
             "AlwaysDeny" => chain.push(Arc::new(AlwaysDeny)),
-            "Node" => tracing::info!("authorization mode Node: node permissions come from the system:node ClusterRole (RBAC)"),
+            "Node" => chain.push(NodeAuthorizer::start(storage.clone()).await),
             other => anyhow::bail!("unknown --authorization-mode {other:?} (want RBAC, AlwaysAllow, AlwaysDeny, Node)"),
         }
     }
@@ -177,9 +193,90 @@ async fn configure_security(opts: &ServerRunOptions, cfg: &mut Config, storage: 
             cert_data: Some(read(c)?),
             key_data: Some(read(k)?),
             insecure: opts.kubelet_certificate_authority.is_none(),
+            cert_resolver: None,
         };
         cfg.kubelet_tls = Some(Arc::new(tls.rustls().map_err(anyhow::Error::msg)?));
     }
     tracing::info!(authentication = ?kinds, authorization = ?modes, service_account_tokens = cfg.service_accounts.is_some(), kubelet_tls = cfg.kubelet_tls.is_some(), "secure serving enabled");
     Ok(())
+}
+
+/// The cluster-authentication-trust controller: publishes how this server authenticates
+/// clients and front proxies in `kube-system/extension-apiserver-authentication`, where
+/// extension API servers (metrics-server) read it.
+async fn publish_authentication_info(server: &std::sync::Arc<k8s_apiserver::ApiServer>, opts: &ServerRunOptions) -> anyhow::Result<()> {
+    let mut data = serde_json::Map::new();
+    if let Some(p) = &opts.client_ca_file {
+        data.insert("client-ca-file".into(), serde_json::json!(std::fs::read_to_string(p).context("reading --client-ca-file")?));
+    }
+    if let Some(p) = &opts.requestheader_client_ca_file {
+        let list = |v: &[String]| serde_json::to_string(&v.iter().filter(|x| !x.is_empty()).collect::<Vec<_>>()).unwrap();
+        data.insert("requestheader-username-headers".into(), serde_json::json!(list(&opts.requestheader_username_headers)));
+        data.insert("requestheader-group-headers".into(), serde_json::json!(list(&opts.requestheader_group_headers)));
+        data.insert("requestheader-extra-headers-prefix".into(), serde_json::json!(list(&opts.requestheader_extra_headers_prefix)));
+        data.insert(
+            "requestheader-client-ca-file".into(),
+            serde_json::json!(std::fs::read_to_string(p).context("reading --requestheader-client-ca-file")?),
+        );
+        data.insert("requestheader-allowed-names".into(), serde_json::json!(list(&opts.requestheader_allowed_names)));
+    }
+    if data.is_empty() {
+        return Ok(());
+    }
+    let Some(info) = server.registry.lookup("", "v1", "configmaps") else { return Ok(()) };
+    let key = info.key("kube-system", "extension-apiserver-authentication");
+    match server.storage.get(&key).await {
+        Ok(mut cur) => {
+            if cur.get("data") != Some(&serde_json::Value::Object(data.clone())) {
+                cur["data"] = serde_json::Value::Object(data);
+                server.storage.update(&key, None, cur).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+        }
+        Err(_) => {
+            let obj = serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap",
+                "metadata": {"name": "extension-apiserver-authentication", "namespace": "kube-system"}, "data": data});
+            server.create_internal("", "v1", "configmaps", "kube-system", obj).await.map_err(|e| anyhow::anyhow!(e.message))?;
+        }
+    }
+    Ok(())
+}
+
+/// `--etcd-servers` → etcd3 storage (as upstream); otherwise the in-memory store.
+async fn open_storage(opts: &ServerRunOptions) -> anyhow::Result<Arc<dyn Storage>> {
+    if opts.storage_media_type != "application/json" {
+        anyhow::bail!("--storage-media-type {:?} is not supported: use application/json", opts.storage_media_type);
+    }
+    let transformer = match &opts.encryption_provider_config {
+        Some(p) => {
+            let yaml = std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()))?;
+            Some(Arc::new(k8s_apiserver::storage::value::Transformer::from_yaml(&yaml).map_err(anyhow::Error::msg)?))
+        }
+        None => None,
+    };
+    if opts.etcd_servers.is_empty() {
+        if transformer.is_some() {
+            anyhow::bail!("--encryption-provider-config needs --etcd-servers");
+        }
+        return Ok(match &opts.data_dir {
+            Some(dir) => MemoryStore::open(dir).map_err(|e| anyhow::anyhow!(e)).context("opening storage")?,
+            None => {
+                tracing::warn!("no --etcd-servers or --data-dir given: cluster state is kept in memory only");
+                MemoryStore::new()
+            }
+        });
+    }
+    let read = |p: &Option<std::path::PathBuf>| -> anyhow::Result<Option<Vec<u8>>> {
+        p.as_ref().map(|p| std::fs::read(p).with_context(|| format!("reading {}", p.display()))).transpose()
+    };
+    let cfg = k8s_apiserver::storage::etcd3::EtcdConfig {
+        endpoints: opts.etcd_servers.clone(),
+        ca: read(&opts.etcd_cafile)?,
+        cert: read(&opts.etcd_certfile)?,
+        key: read(&opts.etcd_keyfile)?,
+        prefix: opts.etcd_prefix.clone(),
+        compaction_interval: (!opts.etcd_compaction_interval.is_zero()).then_some(opts.etcd_compaction_interval),
+        transformer,
+    };
+    let store = k8s_apiserver::storage::etcd3::EtcdStore::connect(cfg).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(store)
 }

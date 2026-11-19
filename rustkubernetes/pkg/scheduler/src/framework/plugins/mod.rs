@@ -5,6 +5,7 @@ pub mod node;
 pub mod nodeaffinity;
 pub mod noderesources;
 pub mod podtopologyspread;
+pub mod volumebinding;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,6 +25,7 @@ pub const DEFAULT_PLUGINS: &[(&str, i64)] = &[
     (nodeaffinity::NAME, 2),
     (node::NODE_PORTS, 0),
     (noderesources::FIT, 1),
+    (volumebinding::NAME, 0),
     (podtopologyspread::NAME, 2),
     (interpodaffinity::NAME, 2),
     (noderesources::BALANCED_ALLOCATION, 1),
@@ -44,6 +46,7 @@ pub fn new_plugin(name: &str, args: Option<&Value>) -> Option<Arc<dyn Plugin>> {
         noderesources::BALANCED_ALLOCATION => Arc::new(noderesources::BalancedAllocation),
         podtopologyspread::NAME => Arc::new(podtopologyspread::PodTopologySpread),
         interpodaffinity::NAME => Arc::new(interpodaffinity::InterPodAffinity),
+        volumebinding::NAME => Arc::new(volumebinding::VolumeBinding),
         _ => return None,
     })
 }

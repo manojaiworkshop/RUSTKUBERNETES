@@ -80,7 +80,11 @@ fn rand_u64() -> u64 {
 
 /// `schedulePod`: filter, score, select.
 pub fn schedule_pod(profile: &Profile, pod: &Pod, nodes: &[NodeInfo]) -> Outcome {
-    let mut state = CycleState::new();
+    schedule_pod_with(profile, pod, nodes, CycleState::new())
+}
+
+/// `schedulePod` with a prepared cycle state (e.g. the volume binder).
+pub fn schedule_pod_with(profile: &Profile, pod: &Pod, nodes: &[NodeInfo], mut state: CycleState) -> Outcome {
     let mut diag = Diagnosis::default();
     let pf = run_pre_filters(profile, &mut state, pod, nodes);
     if !pf.is_success() {

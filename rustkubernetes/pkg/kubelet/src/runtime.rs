@@ -160,10 +160,67 @@ pub struct ExecSession {
 
 pub type LogStream = Pin<Box<dyn Stream<Item = Result<(u8, Bytes)>> + Send>>;
 
+/// `RuntimeReady` / `NetworkReady` (CRI `RuntimeCondition`).
+pub const RUNTIME_READY: &str = "RuntimeReady";
+pub const NETWORK_READY: &str = "NetworkReady";
+
+/// CRI `RuntimeCondition`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeCondition {
+    pub type_: String,
+    pub status: bool,
+    pub reason: String,
+    pub message: String,
+}
+
+impl RuntimeCondition {
+    pub fn ok(type_: &str) -> Self {
+        Self { type_: type_.into(), status: true, reason: String::new(), message: String::new() }
+    }
+
+    pub fn failed(type_: &str, reason: &str, message: String) -> Self {
+        Self { type_: type_.into(), status: false, reason: reason.into(), message }
+    }
+}
+
+/// `kubecontainer.RuntimeCondition.String()`
+impl std::fmt::Display for RuntimeCondition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={} reason:{} message:{}", self.type_, self.status, self.reason, self.message)
+    }
+}
+
+/// CPU and memory of one container (`ContainerStats`, CRI `ContainerStats`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContainerStats {
+    /// When the sample was taken (milliseconds since the epoch).
+    pub timestamp_ms: i64,
+    /// Cumulative CPU time in nanoseconds.
+    pub cpu_usage_ns: u64,
+    /// Memory usage minus inactive file pages (`working_set`).
+    pub memory_working_set_bytes: u64,
+}
+
 #[async_trait]
 pub trait Runtime: Send + Sync {
     /// e.g. `docker://29.0.1`
     async fn version(&self) -> Result<String>;
+
+    /// CRI `Status`: the `RuntimeReady` and `NetworkReady` conditions.
+    async fn status(&self) -> Result<Vec<RuntimeCondition>> {
+        Ok(vec![RuntimeCondition::ok(RUNTIME_READY), RuntimeCondition::ok(NETWORK_READY)])
+    }
+
+    /// Creates a missing host directory (or empty file) for a `DirectoryOrCreate` /
+    /// `FileOrCreate` hostPath volume the kubelet itself may not create.
+    async fn ensure_host_path(&self, path: &std::path::Path, _dir: bool) -> Result<()> {
+        Err(anyhow::anyhow!("cannot create {}: permission denied", path.display()))
+    }
+
+    /// CRI `UpdateRuntimeConfig`: the node's pod CIDR(s), comma separated.
+    async fn update_runtime_config(&self, _pod_cidr: &str) -> Result<()> {
+        Ok(())
+    }
 
     async fn run_pod_sandbox(&self, cfg: &SandboxConfig) -> Result<String>;
     async fn stop_pod_sandbox(&self, id: &str) -> Result<()>;
@@ -189,4 +246,25 @@ pub trait Runtime: Send + Sync {
     async fn exec_exit_code(&self, exec_id: &str) -> Result<Option<i32>>;
 
     async fn logs(&self, id: &str, opts: &LogOptions) -> Result<LogStream>;
+
+    /// CRI `ContainerStats` for a running container.
+    async fn container_stats(&self, _id: &str) -> Result<ContainerStats> {
+        Err(anyhow::anyhow!("container stats are not supported by this runtime"))
+    }
+
+    /// CRI `Attach`: the container's own stdio (`exec_id` of the session is the container id).
+    async fn attach(&self, _id: &str, _stdin: bool, _tty: bool) -> Result<ExecSession> {
+        Err(anyhow::anyhow!("attach is not supported by this runtime"))
+    }
+
+    /// Resizes the TTY of an attached container.
+    async fn resize_container(&self, _id: &str, _width: u16, _height: u16) -> Result<()> {
+        Ok(())
+    }
+
+    /// CRI `PortForward`: copies `stream` to and from `localhost:port` inside the
+    /// sandbox's network namespace until either side finishes.
+    async fn port_forward(&self, _sandbox_id: &str, _port: u16, _stream: tokio::io::DuplexStream) -> Result<()> {
+        Err(anyhow::anyhow!("port forwarding is not supported by this runtime"))
+    }
 }

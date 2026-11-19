@@ -74,6 +74,32 @@ pub struct Machine {
     pub created_by: String,
 }
 
+/// How pods get their IPs and reach each other.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PodNetwork {
+    /// `kubenet` (node pod CIDRs, bridge cbr0, flannel add-on) or `""` (each machine's Docker bridge).
+    #[serde(default)]
+    pub plugin: String,
+    /// kube-controller-manager `--cluster-cidr` (flannel's Network).
+    #[serde(default)]
+    pub pod_cidr: String,
+    /// flannel backend: `vxlan` (works across subnets; pod MTU 1450) or `host-gw` (machines on one L2 network).
+    #[serde(default)]
+    pub backend: String,
+}
+
+impl PodNetwork {
+    pub fn kubenet(&self) -> bool {
+        self.plugin == "kubenet"
+    }
+
+    /// The default for new clusters.
+    pub fn recommended() -> Self {
+        Self { plugin: "kubenet".into(), pod_cidr: "10.244.0.0/16".into(), backend: "vxlan".into() }
+    }
+}
+
 /// Ports one cluster uses on its machines (several clusters may share a host).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Ports {
@@ -83,11 +109,38 @@ pub struct Ports {
     pub scheduler: u16,
     pub proxy_healthz: u16,
     pub proxy_metrics: u16,
+    /// etcd client / peer / metrics ports (kubeadm: 2379, 2380, 2381).
+    #[serde(default = "etcd_client")]
+    pub etcd_client: u16,
+    #[serde(default = "etcd_peer")]
+    pub etcd_peer: u16,
+    #[serde(default = "etcd_metrics")]
+    pub etcd_metrics: u16,
+}
+
+fn etcd_client() -> u16 {
+    2379
+}
+fn etcd_peer() -> u16 {
+    2380
+}
+fn etcd_metrics() -> u16 {
+    2381
 }
 
 impl Default for Ports {
     fn default() -> Self {
-        Self { api: 6443, kubelet: 10250, controller_manager: 10257, scheduler: 10259, proxy_healthz: 10256, proxy_metrics: 10249 }
+        Self {
+            api: 6443,
+            kubelet: 10250,
+            controller_manager: 10257,
+            scheduler: 10259,
+            proxy_healthz: 10256,
+            proxy_metrics: 10249,
+            etcd_client: etcd_client(),
+            etcd_peer: etcd_peer(),
+            etcd_metrics: etcd_metrics(),
+        }
     }
 }
 
@@ -111,6 +164,15 @@ pub struct Cluster {
     pub dns: bool,
     #[serde(default)]
     pub kube_proxy: bool,
+    /// The metrics-server add-on (`kubectl top`).
+    #[serde(default)]
+    pub metrics: bool,
+    /// The local-path-provisioner add-on (default StorageClass `local-path`).
+    #[serde(default)]
+    pub storage: bool,
+    /// Pod network. Clusters created before it existed keep Docker's default bridge.
+    #[serde(default)]
+    pub network: PodNetwork,
     pub created_at: String,
     pub created_by: String,
 }

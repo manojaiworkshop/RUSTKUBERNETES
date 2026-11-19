@@ -23,6 +23,18 @@ pub type Queue = Arc<WorkQueue<String>>;
 /// Result of a sync: `Ok(Some(d))` re-enqueues the key after `d`.
 pub type SyncResult = anyhow::Result<Option<Duration>>;
 
+/// An error that is retried with backoff but not reported (`certificates.IgnorableError`).
+#[derive(Debug)]
+pub struct Ignorable(pub String);
+
+impl std::fmt::Display for Ignorable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Ignorable {}
+
 /// Runs `workers` workers pulling keys from `queue` (`processNextWorkItem`).
 pub async fn run_workers<F, Fut>(name: &'static str, queue: Queue, workers: usize, sync: F)
 where
@@ -50,6 +62,11 @@ where
                     Err(e) if e.to_string().contains("because it is being terminated") => {
                         tracing::debug!(controller = name, key = %key, "namespace terminating: {e}");
                         q.forget(&key);
+                    }
+                    // `IgnorableError` (certificates): expected, retried with backoff, not logged as a failure.
+                    Err(e) if e.downcast_ref::<Ignorable>().is_some() => {
+                        tracing::debug!(controller = name, key = %key, "sync failed: {e}");
+                        q.add_rate_limited(key.clone());
                     }
                     Err(e) => {
                         if q.num_requeues(&key) < 15 {

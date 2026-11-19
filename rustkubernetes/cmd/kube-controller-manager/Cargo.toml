@@ -10,6 +10,7 @@ name = "kube-controller-manager"
 path = "src/main.rs"
 
 [dependencies]
+k8s-apimachinery.workspace = true
 k8s-client-go.workspace = true
 kube-controller.workspace = true
 anyhow.workspace = true

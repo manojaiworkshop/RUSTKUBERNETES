@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use k8s_api::rbac::v1::{AggregationRule, ClusterRole, ClusterRoleBinding, PolicyRule, RoleRef, Subject, GROUP};
+use k8s_api::rbac::v1::{AggregationRule, ClusterRole, ClusterRoleBinding, PolicyRule, Role, RoleBinding, RoleRef, Subject, GROUP};
 use k8s_apimachinery::meta::{LabelSelector, ObjectMeta};
 
 pub const AUTOUPDATE: &str = "rbac.authorization.kubernetes.io/autoupdate";
@@ -67,6 +67,41 @@ fn aggregated(name: &str, own_label: Option<&str>, selector_labels: &[&str]) -> 
 }
 
 /// `ClusterRoles()`.
+/// `NodeRules()`: what every kubelet may do. The Node authorizer applies them
+/// (scoping secrets, configmaps, PVs, PVCs, tokens, nodes, pods and leases to the
+/// node's own objects); the `system:node` ClusterRole carries the same rules.
+pub fn node_rules() -> Vec<PolicyRule> {
+    vec![
+        // Needed to check API access. These creates are non-mutating.
+        r(&["authentication.k8s.io"], &["tokenreviews"], &["create"]),
+        r(&["authorization.k8s.io"], &["subjectaccessreviews", "localsubjectaccessreviews"], &["create"]),
+        // Needed to build serviceLister, to populate env vars for services.
+        r(&[""], &["services"], READ),
+        // Nodes can register Node API objects and report status (NodeRestriction limits them to their own).
+        r(&[""], &["nodes"], &["create", "get", "list", "watch"]),
+        r(&[""], &["nodes/status"], &["update", "patch"]),
+        r(&[""], &["nodes"], &["update", "patch"]),
+        r(&[""], &["events"], &["create", "update", "patch"]),
+        r(&[""], &["pods"], READ),
+        // Mirror pods, pod status and evictions (NodeRestriction limits them to pods bound to the node).
+        r(&[""], &["pods"], &["create", "delete"]),
+        r(&[""], &["pods/status"], &["update", "patch"]),
+        r(&[""], &["pods/eviction"], &["create"]),
+        // Secrets and configmaps referenced by the node's pods (Node authorizer).
+        r(&[""], &["secrets", "configmaps"], &["get", "list", "watch"]),
+        r(&[""], &["persistentvolumeclaims", "persistentvolumes"], &["get"]),
+        r(&[""], &["endpoints"], &["get"]),
+        r(&["certificates.k8s.io"], &["certificatesigningrequests"], &["create", "get", "list", "watch"]),
+        r(&["coordination.k8s.io"], &["leases"], &["get", "create", "update", "patch", "delete"]),
+        r(&["storage.k8s.io"], &["volumeattachments"], &["get"]),
+        r(&[""], &["serviceaccounts/token"], &["create"]),
+        r(&[""], &["persistentvolumeclaims/status"], &["get", "update", "patch"]),
+        r(&["storage.k8s.io"], &["csidrivers"], &["get", "watch", "list"]),
+        r(&["storage.k8s.io"], &["csinodes"], &["get", "create", "update", "patch", "delete"]),
+        r(&["node.k8s.io"], &["runtimeclasses"], &["get", "list", "watch"]),
+    ]
+}
+
 pub fn cluster_roles() -> Vec<ClusterRole> {
     let view_core = &[
         "pods",
@@ -218,24 +253,7 @@ pub fn cluster_roles() -> Vec<ClusterRole> {
                 ),
             ],
         ),
-        role(
-            "system:node",
-            vec![
-                r(&[""], &["nodes"], &["get", "list", "watch", "create", "update", "patch", "delete"]),
-                r(&[""], &["nodes/status"], &["patch", "update"]),
-                r(&[""], &["pods"], &["get", "list", "watch", "create", "delete"]),
-                r(&[""], &["pods/status"], &["patch", "update"]),
-                r(&[""], &["pods/eviction"], &["create"]),
-                r(&[""], &["services", "endpoints", "configmaps", "secrets", "namespaces"], READ),
-                r(&[""], &["persistentvolumeclaims", "persistentvolumes", "serviceaccounts"], &["get"]),
-                r(&[""], &["serviceaccounts/token"], &["create"]),
-                r(&["", "events.k8s.io"], &["events"], EVENTS),
-                r(&["coordination.k8s.io"], &["leases"], &["get", "list", "watch", "create", "update", "patch", "delete"]),
-                r(&["authentication.k8s.io"], &["tokenreviews"], &["create"]),
-                r(&["authorization.k8s.io"], &["subjectaccessreviews", "localsubjectaccessreviews"], &["create"]),
-                r(&["node.k8s.io"], &["runtimeclasses"], READ),
-            ],
-        ),
+        role("system:node", node_rules()),
         role(
             "system:node-proxier",
             vec![
@@ -275,6 +293,45 @@ pub fn cluster_roles() -> Vec<ClusterRole> {
         ),
         role("system:kube-controller-manager", vec![r(&["*"], &["*"], &["*"])]),
         role(
+            "system:volume-scheduler",
+            vec![
+                r(&[""], &["persistentvolumes"], &["get", "list", "patch", "update", "watch"]),
+                r(&["storage.k8s.io"], &["storageclasses"], READ),
+                r(&[""], &["persistentvolumeclaims"], &["get", "list", "patch", "update", "watch"]),
+            ],
+        ),
+        // A role to use for bootstrapping a node's client certificates.
+        role(
+            "system:node-bootstrapper",
+            vec![r(&["certificates.k8s.io"], &["certificatesigningrequests"], &["create", "get", "list", "watch"])],
+        ),
+        // A role making the csrapprover controller approve a node client CSR.
+        role(
+            "system:certificates.k8s.io:certificatesigningrequests:nodeclient",
+            vec![r(&["certificates.k8s.io"], &["certificatesigningrequests/nodeclient"], &["create"])],
+        ),
+        // A role making the csrapprover controller approve a node client CSR requested by the node itself.
+        role(
+            "system:certificates.k8s.io:certificatesigningrequests:selfnodeclient",
+            vec![r(&["certificates.k8s.io"], &["certificatesigningrequests/selfnodeclient"], &["create"])],
+        ),
+        role(
+            "system:certificates.k8s.io:legacy-unknown-approver",
+            vec![r(&["certificates.k8s.io"], &["signers"], &["approve"]).names(&["kubernetes.io/legacy-unknown"])],
+        ),
+        role(
+            "system:certificates.k8s.io:kubelet-serving-approver",
+            vec![r(&["certificates.k8s.io"], &["signers"], &["approve"]).names(&["kubernetes.io/kubelet-serving"])],
+        ),
+        role(
+            "system:certificates.k8s.io:kube-apiserver-client-approver",
+            vec![r(&["certificates.k8s.io"], &["signers"], &["approve"]).names(&["kubernetes.io/kube-apiserver-client"])],
+        ),
+        role(
+            "system:certificates.k8s.io:kube-apiserver-client-kubelet-approver",
+            vec![r(&["certificates.k8s.io"], &["signers"], &["approve"]).names(&["kubernetes.io/kube-apiserver-client-kubelet"])],
+        ),
+        role(
             "system:kubelet-api-admin",
             vec![
                 r(&[""], &["nodes"], &["get", "list", "watch", "proxy"]),
@@ -313,10 +370,32 @@ pub fn cluster_roles() -> Vec<ClusterRole> {
 fn binding(name: &str, role: &str, subjects: Vec<Subject>) -> ClusterRoleBinding {
     ClusterRoleBinding {
         metadata: meta(name, &[]),
-        subjects: Some(subjects),
+        subjects: Some(subjects).filter(|s| !s.is_empty()),
         role_ref: RoleRef { api_group: GROUP.into(), kind: "ClusterRole".into(), name: role.into() },
         ..Default::default()
     }
+}
+
+/// `NamespaceRoles()`: bootstrap Roles in system namespaces.
+pub fn namespace_roles() -> Vec<Role> {
+    let mut reader = r(&[""], &["configmaps"], &["get", "list", "watch"]);
+    // This config map is exposed and contains authentication configuration information.
+    reader.resource_names = Some(vec!["extension-apiserver-authentication".into()]);
+    let mut m = meta("extension-apiserver-authentication-reader", &[]);
+    m.namespace = Some("kube-system".into());
+    vec![Role { metadata: m, rules: Some(vec![reader]), ..Default::default() }]
+}
+
+/// `NamespaceRoleBindings()`
+pub fn namespace_role_bindings() -> Vec<RoleBinding> {
+    let mut m = meta("system::extension-apiserver-authentication-reader", &[]);
+    m.namespace = Some("kube-system".into());
+    vec![RoleBinding {
+        metadata: m,
+        subjects: Some(vec![Subject::user("system:kube-controller-manager"), Subject::user("system:kube-scheduler")]),
+        role_ref: RoleRef { api_group: GROUP.into(), kind: "Role".into(), name: "extension-apiserver-authentication-reader".into() },
+        ..Default::default()
+    }]
 }
 
 /// `ClusterRoleBindings()` (plus kubeadm's `kubeadm:cluster-admins`).
@@ -337,9 +416,12 @@ pub fn cluster_role_bindings() -> Vec<ClusterRoleBinding> {
             vec![Subject::group("system:serviceaccounts")],
         ),
         binding("system:monitoring", "system:monitoring", vec![Subject::group("system:monitoring")]),
-        binding("system:node", "system:node", vec![Subject::group("system:nodes")]),
+        // Deprecated in 1.7 with the Node authorizer: kept, with no subjects, so that
+        // reconciliation never adds the system:nodes group back.
+        binding("system:node", "system:node", vec![]),
         binding("system:node-proxier", "system:node-proxier", vec![Subject::user("system:kube-proxy")]),
         binding("system:kube-scheduler", "system:kube-scheduler", vec![Subject::user("system:kube-scheduler")]),
+        binding("system:volume-scheduler", "system:volume-scheduler", vec![Subject::user("system:kube-scheduler")]),
         binding("system:kube-controller-manager", "system:kube-controller-manager", vec![Subject::user("system:kube-controller-manager")]),
         binding("system:kubelet-api-admin", "system:kubelet-api-admin", vec![Subject::user("kube-apiserver-kubelet-client")]),
     ]

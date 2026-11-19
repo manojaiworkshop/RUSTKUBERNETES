@@ -34,13 +34,21 @@ redis-leader   ClusterIP   10.96.0.2    <none>        6379/TCP       4s
 | **6a** | **Security**: `kubeadm` PKI + kubeconfigs, TLS everywhere, x509 / token / ServiceAccount JWT authentication, RBAC (+ bootstrap policy, escalation prevention), impersonation, access/token reviews, TokenRequest + projected tokens, authenticated kubelet API | ✅ done |
 | **6b** | **Cluster DNS**: CoreDNS add-on, kubelet `dnsPolicy` / `--cluster-dns` | ✅ done |
 | **UI** | **rustkubeadmin** web console (`admin/`): super admin from env, users with console permissions and per-namespace RBAC (via impersonation), machines over SSH with an offline installer, cluster create/import/start/stop/delete, live nodes/pods/workloads | ✅ done |
-| 6c | etcd v3 storage backend | ⏳ next |
-| 6d | containerd CRI backend, OpenAPI schemas (`kubectl explain`), metrics, audit, API Priority & Fairness | planned |
+| **6c** | **etcd storage**: etcd v3 gRPC client, upstream store semantics and key layout, compaction, `etcd` health checks, kubeadm etcd PKI + flags, encryption at rest (`EncryptionConfiguration`, aesgcm) | ✅ done |
+| **6d** | **Pod network across machines**: node IPAM (`--allocate-node-cidrs`), kubelet `--network-plugin=kubenet` (bridge `cbr0` on `spec.podCIDR`, NetworkReady), flannel add-on (vxlan / host-gw, `--ip-masq`) | ✅ done |
+| **6e** | **Node authorization**: Node authorizer (graph of pods → secrets/configmaps/PVCs/ServiceAccounts, own Node/Lease/pods), NodeRestriction admission, `--enable/disable-admission-plugins` | ✅ done |
+| **6f** | **Streaming**: `kubectl port-forward` (SPDY/3.1 via WebSocket tunnel or direct, into the pod's network namespace), `attach`, `run -i`, `cp`, exec/attach over SPDY | ✅ done |
+| **6g** | **Resource metrics**: kubelet `/metrics/resource`, aggregation layer (`APIService`, availability, front-proxy proxying, `extension-apiserver-authentication`), metrics-server add-on, `kubectl top` | ✅ done |
+| **6h** | **Persistent volumes**: PV/PVC/StorageClass, `DefaultStorageClass` + `StorageObjectInUseProtection`, PV binder (binding, host-path & external provisioning, reclaim), protection and ephemeral-volume controllers, scheduler `VolumeBinding` (`WaitForFirstConsumer`), kubelet PVC mounts, local-path-provisioner add-on | ✅ done |
+| **6i** | **Certificates**: `certificates.k8s.io/v1` CSRs (`kubectl certificate approve/deny`), signing/approving/cleaner controllers, CSR admission plugins, bootstrap tokens (`--enable-bootstrap-token-auth`, bootstrap-signer, token-cleaner), kubelet TLS bootstrap + client/serving certificate rotation, `kubeadm token`, `kubeadm join` discovery, `kubeadm certs check-expiration/renew` | ✅ done |
+| **6j** | **CustomResourceDefinitions**: `apiextensions.k8s.io/v1` CRDs (validation, naming, `Established`), structural schemas (validation, defaulting, pruning), `fieldValidation` + `Warning` headers, `status`/`scale` subresources, printer columns, multi-version with `None`/`Webhook` conversion, `kubectl explain` for custom resources, cleanup finalizer, GC of custom resources | ✅ done |
+| next | Ingress/NetworkPolicy/HPA/ResourceQuota/LimitRange/PDB, HA control plane, audit, API Priority & Fairness, containerd, conformance | planned |
 
 See [docs/roadmap.md](docs/roadmap.md) for the detailed plan, [docs/phase-1-core.md](docs/phase-1-core.md) and
 [docs/phase-2-controllers.md](docs/phase-2-controllers.md), [docs/phase-3-scheduler.md](docs/phase-3-scheduler.md),
 [docs/phase-4-kubelet.md](docs/phase-4-kubelet.md), [docs/phase-5-kube-proxy.md](docs/phase-5-kube-proxy.md),
-[docs/phase-6-security.md](docs/phase-6-security.md) for
+[docs/phase-6-security.md](docs/phase-6-security.md), [docs/phase-6c-etcd.md](docs/phase-6c-etcd.md),
+[docs/phase-6d-pod-network.md](docs/phase-6d-pod-network.md), [docs/phase-6e-node-authorization.md](docs/phase-6e-node-authorization.md), [docs/phase-6f-streaming.md](docs/phase-6f-streaming.md), [docs/phase-6g-metrics.md](docs/phase-6g-metrics.md), [docs/phase-6h-storage.md](docs/phase-6h-storage.md), [docs/phase-6i-certificates.md](docs/phase-6i-certificates.md), [docs/phase-6j-crds.md](docs/phase-6j-crds.md) for
 what each phase implements and how, and **[docs/testing-guide.md](docs/testing-guide.md)** for hands-on commands.
 
 ## Repository layout
@@ -74,6 +82,11 @@ rustkubernetes/
 │   ├── apiserver/                    generic API server: storage, watch, handlers, admission, discovery, OpenAPI
 │   └── client-go/                    REST client, typed Api<T>, kubeconfig, informers, workqueue,
 │                                     leader election, events, discovery
+├── vendor/go.etcd.io/etcd/client/v3/  etcd v3 gRPC client from etcd's protos (k8s: vendor/)
+├── staging/src/k8s.io/component-helpers/ storage/volume helpers (PV matching and binding)
+├── staging/src/k8s.io/kube-aggregator/ aggregation layer (APIService, proxy to extension API servers)
+├── staging/src/k8s.io/apiextensions-apiserver/ CustomResourceDefinitions (schemas, conversion, CRD controllers)
+├── vendor/github.com/moby/spdystream/ SPDY/3.1 (port-forward, exec/attach for older clients)
 ├── test/integration/                 in-process API server tests (k8s: test/integration)
 ├── admin/                            rustkubeadmin web console: Rust API + Next.js UI (docs/admin-console.md)
 ├── cluster/addons/dns/coredns/       CoreDNS add-on manifest (k8s: cluster/addons)
@@ -98,6 +111,7 @@ rustkubernetes/
 | `kube-proxy-core` | `pkg/proxy` | `k8s.io/kubernetes/pkg/proxy` |
 | `kube-serviceaccount` | `pkg/serviceaccount` | `k8s.io/kubernetes/pkg/serviceaccount` |
 | `kube-kubemark` | `pkg/kubemark` | `k8s.io/kubernetes/pkg/kubemark` |
+| `etcd-clientv3` | `vendor/go.etcd.io/etcd/client/v3` | `go.etcd.io/etcd/client/v3` |
 | `kube-plugin` | `plugin` | `k8s.io/kubernetes/plugin` |
 | `kube-apiserver` (bin) | `cmd/kube-apiserver` | `cmd/kube-apiserver` |
 | `kube-controller-manager` (bin) | `cmd/kube-controller-manager` | `cmd/kube-controller-manager` |
@@ -117,8 +131,10 @@ Optional: the official `kubectl` for compatibility testing.
 
 ```bash
 make build                 # or: cargo build
-make test                  # unit + integration tests (120 tests)
+make test                  # unit + integration tests (185 tests)
 make verify                # fmt + clippy + tests + kubectl command tests
+make test-etcd             # storage conformance + kubectl suite against a real etcd
+make test-e2e-network      # two machines (docker-in-docker): node IPAM, kubenet, flannel, cross-node traffic
 make test-e2e-node         # secure cluster: pods, logs, exec, volumes, probes, Services, RBAC, tokens, DNS (59 checks)
 hack/local-up-cluster.sh   # secure cluster (TLS, RBAC, CoreDNS): apiserver + KCM + scheduler + kubelet + kube-proxy
 SECURE=0 hack/local-up-cluster.sh                   # old insecure HTTP dev mode
@@ -184,8 +200,32 @@ pods get auto-mounted, auto-rotated ServiceAccount tokens and can call the API a
 `kubectl logs/exec` go to an authenticated kubelet over TLS; CoreDNS resolves `svc.ns.svc.cluster.local`, short
 names and external names.
 
-Not yet (needs later phases): etcd storage, `port-forward`, `attach`, `cp`, `top`, `explain` (needs OpenAPI
-schemas), CNI networking across hosts, Node authorizer, certificate rotation.
+With Phase 6c: state lives in etcd (gRPC, mutual TLS, upstream key layout, compaction), `/readyz` checks etcd, and
+Secrets can be encrypted at rest with an `EncryptionConfiguration`.
+
+With Phase 6d: every node gets a pod CIDR from kube-controller-manager, the kubelet's kubenet plugin puts pods on
+`cbr0`, and the flannel add-on routes between machines, so pods, Services and NodePorts work across machines
+(rustkubeadmin clusters use this by default).
+
+With Phase 6e: kubelets are authorized by the Node authorizer (only the Secrets, ConfigMaps and tokens their own
+pods use; only their own Node, Lease and pods) and NodeRestriction checks their writes.
+
+With Phase 6f: `kubectl port-forward`, `attach`, `run -i`, `cp`, and exec/attach over SPDY for older clients.
+
+With Phase 6g: `kubectl top nodes|pods` through metrics-server and the aggregation layer (`APIService`).
+
+With Phase 6h: PersistentVolumeClaims bound to static or dynamically provisioned volumes (`WaitForFirstConsumer`
+included), kept by reclaim policies and protection finalizers.
+
+With Phase 6i: `kubectl get csr`, `kubectl certificate approve|deny`; kubelets renew their certificates;
+`kubeadm token`, `kubeadm join`, `kubeadm certs check-expiration|renew`.
+
+With Phase 6j: CustomResourceDefinitions — `kubectl apply -f crd.yaml`, custom resources with schema validation,
+defaulting and pruning, `status`/`scale` subresources, printer columns, several versions, `kubectl explain` — so
+operators and Helm charts that ship CRDs install.
+
+Not yet (needs later phases): volume expansion and CSI, `explain` for built-in types (needs their OpenAPI
+schemas), CNI plugins (pods use kubenet), certificate rotation.
 
 ## License
 

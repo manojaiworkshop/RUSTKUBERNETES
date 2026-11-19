@@ -21,6 +21,11 @@ pub struct PodStrategy {
 
 #[async_trait]
 impl Strategy for PodStrategy {
+    /// `podStatusStrategy` keeps label/annotation changes (no `ResetObjectMetaForStatus`).
+    fn status_updates_metadata(&self) -> bool {
+        true
+    }
+
     fn prepare_for_create(&self, obj: &mut Value) {
         defaults::set_pod_defaults(obj);
     }
@@ -63,13 +68,14 @@ impl Strategy for PodStrategy {
         }
     }
 
-    /// `pods/log`, `pods/exec`, `pods/attach` → the kubelet of the pod's node
-    /// (`pkg/registry/core/pod/strategy.go: LogLocation, ExecLocation`).
+    /// `pods/log`, `pods/exec`, `pods/attach`, `pods/portforward` → the kubelet of the pod's node
+    /// (`pkg/registry/core/pod/strategy.go: LogLocation, ExecLocation, PortForwardLocation`).
     async fn connect(&self, ctx: &StrategyContext<'_>, sub: &str, pod: &Value, query: &str) -> Option<Result<String, ApiError>> {
-        if !matches!(sub, "log" | "exec" | "attach") {
-            return None;
+        match sub {
+            "log" | "exec" | "attach" => Some(kubelet_location(ctx, sub, pod, query, self.kubelet_https).await),
+            "portforward" => Some(port_forward_location(ctx, pod, query, self.kubelet_https).await),
+            _ => None,
         }
-        Some(kubelet_location(ctx, sub, pod, query, self.kubelet_https).await)
     }
 
     fn table_columns(&self) -> Vec<Column> {
@@ -151,6 +157,61 @@ fn query_param(query: &str, key: &str) -> Option<String> {
     query.split('&').filter_map(|kv| kv.split_once('=')).find(|(k, _)| *k == key).map(|(_, v)| v.replace('+', " "))
 }
 
+/// `streamParams` for `PodExecOptions` / `PodAttachOptions`: the kubelet's own
+/// parameters `input`, `output`, `error`, `tty` (=1) and repeated `command`.
+pub fn stream_params(query: &str) -> String {
+    let truthy = |v: &str| v == "true" || v == "1";
+    let mut out = vec![];
+    for (k, v) in query.split('&').filter_map(|kv| kv.split_once('=').or(Some((kv, "")))) {
+        let flag = match k {
+            "stdin" => "input",
+            "stdout" => "output",
+            "stderr" => "error",
+            "tty" => "tty",
+            "command" => {
+                out.push(format!("command={v}"));
+                continue;
+            }
+            _ => continue,
+        };
+        if truthy(v) {
+            out.push(format!("{flag}=1"));
+        }
+    }
+    out.join("&")
+}
+
+/// `PortForwardLocation`: `/portForward/{namespace}/{name}` on the pod's kubelet.
+async fn port_forward_location(ctx: &StrategyContext<'_>, pod: &Value, query: &str, https: bool) -> Result<String, ApiError> {
+    let name = pod.name();
+    let node = str_at(pod, "/spec/nodeName");
+    if node.is_empty() {
+        return Err(ApiError::bad_request(format!("pod {name} does not have a host assigned")));
+    }
+    let (ip, port) = kubelet_endpoint(ctx, node).await?;
+    let scheme = if https { "https" } else { "http" };
+    let host = if ip.contains(':') { format!("[{ip}]") } else { ip };
+    // `ports` (repeated) → `port=a,b`
+    let ports: Vec<String> =
+        query.split('&').filter_map(|kv| kv.split_once('=')).filter(|(k, _)| *k == "ports").map(|(_, v)| v.to_string()).collect();
+    let params = if ports.is_empty() { String::new() } else { format!("port={}", ports.join(",")) };
+    Ok(format!("{scheme}://{host}:{port}/portForward/{}/{name}?{params}", pod.namespace()))
+}
+
+/// The kubelet address and port a node reports.
+async fn kubelet_endpoint(ctx: &StrategyContext<'_>, node: &str) -> Result<(String, i64), ApiError> {
+    let n = ctx.storage.get(&format!("/registry/minions/{node}")).await.map_err(|_| ApiError::not_found("", "nodes", node))?;
+    let ip = n
+        .pointer("/status/addresses")
+        .and_then(Value::as_array)
+        .and_then(|a| a.iter().find(|x| x["type"] == "InternalIP").or_else(|| a.first()))
+        .and_then(|x| x["address"].as_str())
+        .ok_or_else(|| ApiError::bad_request(format!("node {node} has no address")))?
+        .to_string();
+    let port = n.pointer("/status/daemonEndpoints/kubeletEndpoint/Port").and_then(Value::as_i64).unwrap_or(10250);
+    Ok((ip, port))
+}
+
 async fn kubelet_location(ctx: &StrategyContext<'_>, sub: &str, pod: &Value, query: &str, https: bool) -> Result<String, ApiError> {
     let name = pod.name();
     let containers: Vec<String> = ["containers", "initContainers", "ephemeralContainers"]
@@ -183,7 +244,7 @@ async fn kubelet_location(ctx: &StrategyContext<'_>, sub: &str, pod: &Value, que
     if node.is_empty() {
         return Err(ApiError::bad_request(format!("pod {name} does not have a host assigned")));
     }
-    let n = ctx.storage.get(&format!("/registry/nodes/{node}")).await.map_err(|_| ApiError::not_found("", "nodes", node))?;
+    let n = ctx.storage.get(&format!("/registry/minions/{node}")).await.map_err(|_| ApiError::not_found("", "nodes", node))?;
     let ip = n
         .pointer("/status/addresses")
         .and_then(Value::as_array)
@@ -193,7 +254,8 @@ async fn kubelet_location(ctx: &StrategyContext<'_>, sub: &str, pod: &Value, que
     let port = n.pointer("/status/daemonEndpoints/kubeletEndpoint/Port").and_then(Value::as_i64).unwrap_or(10250);
     let path = if sub == "log" { "containerLogs" } else { sub };
     let scheme = if https { "https" } else { "http" };
-    Ok(format!("{scheme}://{ip}:{port}/{path}/{}/{name}/{container}?{query}", pod.namespace()))
+    let params = if sub == "log" { query.to_string() } else { stream_params(query) };
+    Ok(format!("{scheme}://{ip}:{port}/{path}/{}/{name}/{container}?{params}", pod.namespace()))
 }
 
 /// `POST pods/<name>/binding`: assigns the pod to a node (used by the scheduler).
@@ -227,6 +289,14 @@ async fn bind(ctx: &StrategyContext<'_>, pod: &Value, binding: Value) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_stream_params() {
+        assert_eq!(
+            stream_params("command=sh&command=-c&container=app&stdin=true&stdout=true&stderr=false&tty=true"),
+            "command=sh&command=-c&input=1&output=1&tty=1"
+        );
+    }
 
     #[test]
     fn status_reason() {

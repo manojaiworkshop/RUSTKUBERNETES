@@ -93,8 +93,11 @@ pub fn build_table(
     let rows: Vec<Value> = objects
         .iter()
         .map(|o| {
-            let mut c = vec![Value::String(o.name().to_string())];
-            c.extend(cells(o));
+            // A printer may supply the Name cell itself (one cell more than its columns),
+            // e.g. `standard (default)` for StorageClasses.
+            let own = cells(o);
+            let mut c = if own.len() == columns.len() + 1 { vec![] } else { vec![Value::String(o.name().to_string())] };
+            c.extend(own);
             let mut row = json!({ "cells": c });
             if let Some(obj) = row_object(o, include) {
                 row["object"] = obj;

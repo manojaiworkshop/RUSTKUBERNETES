@@ -193,7 +193,82 @@ fn downward_files(pod: &Pod, src: &Value) -> BTreeMap<String, (Vec<u8>, u32)> {
 }
 
 /// Prepares every volume of the pod; returns volume name → host path.
-pub async fn setup(client: &Client, root: &Path, pod: &Pod) -> Result<HashMap<String, PathBuf>> {
+/// A `hostPath` source (pod volume or PersistentVolume), with its type check.
+async fn host_path(rt: &dyn crate::runtime::Runtime, hp: &Value) -> Result<PathBuf> {
+    let p = PathBuf::from(hp["path"].as_str().unwrap_or(""));
+    match hp["type"].as_str().unwrap_or("") {
+        // Upstream's kubelet runs as root; ours may not, so the runtime creates what it can't.
+        "DirectoryOrCreate" if !p.is_dir() => match std::fs::create_dir_all(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => rt.ensure_host_path(&p, true).await?,
+            r => r.with_context(|| format!("creating hostPath {}", p.display()))?,
+        },
+        "FileOrCreate" if !p.exists() => {
+            if let Some(parent) = p.parent().filter(|d| !d.exists()) {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match std::fs::write(&p, b"") {
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => rt.ensure_host_path(&p, false).await?,
+                r => r.with_context(|| format!("creating hostPath {}", p.display()))?,
+            }
+        }
+        "Directory" if !p.is_dir() => bail!("hostPath type check failed: {} is not a directory", p.display()),
+        "File" if !p.is_file() => bail!("hostPath type check failed: {} is not a file", p.display()),
+        _ => {}
+    }
+    Ok(p)
+}
+
+/// `persistentVolumeClaim` and generic `ephemeral` volumes (volume manager
+/// `desired_state_of_world_populator`): the claim must be bound; its volume's
+/// `hostPath` or `local` path is mounted.
+async fn persistent_volume_path(
+    client: &Client,
+    rt: &dyn crate::runtime::Runtime,
+    pod: &Pod,
+    vol: &str,
+    src: &BTreeMap<String, Value>,
+) -> Result<PathBuf> {
+    use k8s_api::core::v1::{PersistentVolume, PersistentVolumeClaim};
+    let ns = pod.metadata.namespace();
+    let claim = match src.get("persistentVolumeClaim") {
+        Some(c) => c["claimName"].as_str().unwrap_or("").to_string(),
+        None => format!("{}-{vol}", pod.metadata.name()),
+    };
+    let pvc = k8s_client_go::Api::<PersistentVolumeClaim>::namespaced(client.clone(), ns)
+        .get_opt(&claim)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("error processing PVC {ns}/{claim}: PVC {claim:?} not found"))?;
+    if src.contains_key("ephemeral") {
+        // The claim must belong to this pod (`ephemeral.VolumeIsForPod`).
+        let owned = pvc.metadata.owner_references.iter().flatten().any(|o| Some(&o.uid) == pod.metadata.uid.as_ref());
+        if !owned {
+            bail!("error processing PVC {ns}/{claim}: PVC was not created for pod {ns}/{} (pod is not owner)", pod.metadata.name());
+        }
+    }
+    let phase = pvc.status.as_ref().and_then(|s| s["phase"].as_str()).unwrap_or("");
+    let vn = pvc.spec.as_ref().and_then(|s| s["volumeName"].as_str()).unwrap_or("");
+    if phase != "Bound" || vn.is_empty() {
+        bail!("error processing PVC {ns}/{claim}: PVC {ns}/{claim} has non-bound phase ({phase:?}) or empty pvc.Spec.VolumeName ({vn:?})");
+    }
+    let pv = k8s_client_go::Api::<PersistentVolume>::all(client.clone())
+        .get_opt(vn)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("error processing PVC {ns}/{claim}: failed to fetch PV {vn:?} from API server: not found"))?;
+    let spec = pv.spec.unwrap_or_default();
+    if let Some(hp) = spec.get("hostPath").filter(|h| h.is_object()) {
+        return host_path(rt, hp).await;
+    }
+    if let Some(l) = spec.get("local").filter(|l| l.is_object()) {
+        let p = PathBuf::from(l["path"].as_str().unwrap_or(""));
+        if !p.exists() {
+            bail!("MountVolume.NewMounter initialization failed for volume {vn:?} : path {:?} does not exist", p.display().to_string());
+        }
+        return Ok(p);
+    }
+    bail!("volume {vol:?}: PersistentVolume {vn:?} has a volume source this kubelet cannot mount")
+}
+
+pub async fn setup(client: &Client, rt: &dyn crate::runtime::Runtime, root: &Path, pod: &Pod) -> Result<HashMap<String, PathBuf>> {
     let uid = pod.metadata.uid.clone().unwrap_or_default();
     let ns = pod.metadata.namespace();
     let base = pod_dir(root, &uid).join("volumes");
@@ -207,19 +282,9 @@ pub async fn setup(client: &Client, root: &Path, pod: &Pod) -> Result<HashMap<St
             let _ = ed; // medium: Memory is served from disk (tmpfs needs root)
             p
         } else if let Some(hp) = src.get("hostPath") {
-            let p = PathBuf::from(hp["path"].as_str().unwrap_or(""));
-            match hp["type"].as_str().unwrap_or("") {
-                "DirectoryOrCreate" => std::fs::create_dir_all(&p).with_context(|| format!("creating hostPath {}", p.display()))?,
-                "FileOrCreate" => {
-                    if !p.exists() {
-                        std::fs::write(&p, b"")?;
-                    }
-                }
-                "Directory" if !p.is_dir() => bail!("hostPath type check failed: {} is not a directory", p.display()),
-                "File" if !p.is_file() => bail!("hostPath type check failed: {} is not a file", p.display()),
-                _ => {}
-            }
-            p
+            host_path(rt, hp).await?
+        } else if src.get("persistentVolumeClaim").is_some() || src.get("ephemeral").is_some_and(Value::is_object) {
+            persistent_volume_path(client, rt, pod, &v.name, src).await?
         } else if let Some(cm) = src.get("configMap") {
             let p = base.join("kubernetes.io~configmap").join(&v.name);
             let name = cm["name"].as_str().unwrap_or("");

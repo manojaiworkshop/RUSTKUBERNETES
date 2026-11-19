@@ -1,0 +1,20 @@
+[package]
+name = "etcd-clientv3"
+description = "etcd v3 gRPC client (KV, Watch, Maintenance), generated from etcd's api protos (go.etcd.io/etcd/client/v3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost = "0.14"
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring"] }
+tonic-prost = "0.14"
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+
+[build-dependencies]
+protox = "0.10"
+tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
+
+[lints]
+workspace = true

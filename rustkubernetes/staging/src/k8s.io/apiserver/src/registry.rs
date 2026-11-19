@@ -58,6 +58,22 @@ pub trait Strategy: Send + Sync {
         vec![]
     }
 
+    /// `PrepareForUpdate` of a status-like subresource (`status`, `approval`),
+    /// after the generic handler took `.status` from the request and the rest from `old`.
+    fn prepare_for_subresource_update(&self, _sub: &str, _new: &mut Value, _old: &Value) {}
+
+    /// Validation for writes through `/approval` (`certificatesigningrequests`).
+    fn validate_approval_update(&self, _new: &Value, _old: &Value) -> ErrorList {
+        vec![]
+    }
+
+    /// Whether `/status` writes may also change labels and annotations. Most
+    /// status strategies call `ResetObjectMetaForStatus`; nodes and pods do not
+    /// (the kubelet and network add-ons annotate nodes through `nodes/status`).
+    fn status_updates_metadata(&self) -> bool {
+        false
+    }
+
     /// Side effects before the object is persisted (e.g. ClusterIP allocation).
     async fn before_create(&self, _ctx: &StrategyContext<'_>, _obj: &mut Value) -> Result<(), ApiError> {
         Ok(())
@@ -138,6 +154,36 @@ pub trait Strategy: Send + Sync {
         None
     }
 
+    /// Where the `scale` subresource reads and writes replicas.
+    fn scale_paths(&self) -> ScalePaths {
+        ScalePaths::default()
+    }
+
+    /// Whether `application/strategic-merge-patch+json` is accepted (custom
+    /// resources have no patch strategy metadata, so they only take JSON and
+    /// merge patches and apply).
+    fn supports_strategic_merge_patch(&self) -> bool {
+        true
+    }
+
+    /// Fields of an incoming object its schema does not declare (`spec.foo`),
+    /// reported according to `?fieldValidation=` (Strict: error, Warn: warning).
+    fn unknown_fields(&self, _obj: &Value) -> Vec<String> {
+        vec![]
+    }
+
+    /// A warning returned with every request for this resource (deprecated
+    /// custom resource versions).
+    fn request_warning(&self) -> Option<String> {
+        None
+    }
+
+    /// The kind's OpenAPI v3 schema as (component name, schema), published under
+    /// `/openapi/v3` for `kubectl explain` (custom resources).
+    fn openapi_schema(&self) -> Option<(String, Value)> {
+        None
+    }
+
     /// Extra table columns after `NAME` (default: `AGE`).
     fn table_columns(&self) -> Vec<Column> {
         vec![Column::new("Age", "string", "")]
@@ -147,6 +193,37 @@ pub trait Strategy: Send + Sync {
     fn table_cells(&self, obj: &Value) -> Vec<Value> {
         vec![age_cell(obj)]
     }
+}
+
+/// JSON paths of the `scale` subresource (`.spec.replicas`, ...).
+#[derive(Clone, Debug)]
+pub struct ScalePaths {
+    pub spec_replicas: String,
+    pub status_replicas: String,
+    pub selector: ScaleSelector,
+}
+
+#[derive(Clone, Debug)]
+pub enum ScaleSelector {
+    /// `.spec.selector.matchLabels` rendered as `k=v,...` (workload controllers).
+    SpecMatchLabels,
+    /// A string at a JSON path (`labelSelectorPath` of a custom resource); `None`: no selector.
+    Path(Option<String>),
+}
+
+impl Default for ScalePaths {
+    fn default() -> Self {
+        Self {
+            spec_replicas: ".spec.replicas".into(),
+            status_replicas: ".status.replicas".into(),
+            selector: ScaleSelector::SpecMatchLabels,
+        }
+    }
+}
+
+/// `.spec.replicas` → `/spec/replicas` (simple dotted JSON paths only).
+pub fn json_path_pointer(path: &str) -> String {
+    path.split('.').filter(|p| !p.is_empty()).map(|p| format!("/{}", p.replace('~', "~0").replace('/', "~1"))).collect()
 }
 
 /// A strategy with no special behaviour (used for simple resources).
@@ -176,6 +253,14 @@ pub struct ResourceInfo {
     /// Supported subresources (`status`, `scale`, `binding`, ...).
     pub subresources: Vec<String>,
     pub strategy: Arc<dyn Strategy>,
+    /// Storage key prefix when it is not derived from group and plural
+    /// (custom resources: `<group>/<plural>`).
+    pub storage_prefix: Option<String>,
+    /// `apiVersion` objects are persisted with, when it differs from the served
+    /// version (multi-version custom resources); reads and writes convert.
+    pub storage_version: Option<String>,
+    /// Converts between the served and the storage version.
+    pub converter: Option<Arc<dyn crate::storage::converting::Converter>>,
 }
 
 impl ResourceInfo {
@@ -197,26 +282,52 @@ impl ResourceInfo {
         }
     }
 
-    /// Storage key for one object.
+    /// The resource's part of storage keys, as upstream lays out etcd
+    /// (`StorageFactory.ResourcePrefix`): the plural without the group (with it
+    /// for APIServices and CRDs), except nodes (`minions`), services (`services/specs`), endpoints
+    /// (`services/endpoints`), replicationcontrollers (`controllers`) and
+    /// ingresses (`ingress`).
+    pub fn storage_prefix(&self) -> String {
+        match &self.storage_prefix {
+            Some(p) => p.clone(),
+            None => etcd_resource_prefix(&self.group, &self.plural),
+        }
+    }
+
+    /// Storage key for one object (`/registry/<prefix>/<namespace>/<name>`).
     pub fn key(&self, namespace: &str, name: &str) -> String {
         if self.namespaced {
-            format!("/registry/{}/{}/{}", self.group_resource(), namespace, name)
+            format!("/registry/{}/{}/{}", self.storage_prefix(), namespace, name)
         } else {
-            format!("/registry/{}/{}", self.group_resource(), name)
+            format!("/registry/{}/{}", self.storage_prefix(), name)
         }
     }
 
     /// Storage prefix for listing (all namespaces if `namespace` is empty).
     pub fn prefix(&self, namespace: &str) -> String {
         if self.namespaced && !namespace.is_empty() {
-            format!("/registry/{}/{}/", self.group_resource(), namespace)
+            format!("/registry/{}/{}/", self.storage_prefix(), namespace)
         } else {
-            format!("/registry/{}/", self.group_resource())
+            format!("/registry/{}/", self.storage_prefix())
         }
     }
 
     pub fn has_subresource(&self, sub: &str) -> bool {
         self.subresources.iter().any(|s| s == sub)
+    }
+
+    /// The store as this resource's clients see it: objects in the served
+    /// version even when they are persisted in another one.
+    pub fn store(&self, storage: &Arc<dyn Storage>) -> Arc<dyn Storage> {
+        match (&self.storage_version, &self.converter) {
+            (Some(stored), Some(conv)) if *stored != self.api_version() => Arc::new(crate::storage::converting::ConvertingStorage {
+                inner: storage.clone(),
+                converter: conv.clone(),
+                served: self.api_version(),
+                stored: stored.clone(),
+            }),
+            _ => storage.clone(),
+        }
     }
 }
 
@@ -239,6 +350,9 @@ impl ResourceBuilder {
                 namespaced,
                 subresources: vec![],
                 strategy: Arc::new(DefaultStrategy { has_status: false }),
+                storage_prefix: None,
+                storage_version: None,
+                converter: None,
             },
         }
     }
@@ -263,15 +377,35 @@ impl ResourceBuilder {
         self
     }
 
+    pub fn singular(mut self, s: &str) -> Self {
+        self.info.singular = s.to_string();
+        self
+    }
+
+    pub fn storage_prefix(mut self, p: &str) -> Self {
+        self.info.storage_prefix = Some(p.to_string());
+        self
+    }
+
+    /// Objects are stored as `api_version` (see [`ResourceInfo::storage_version`]).
+    pub fn storage_version(mut self, api_version: &str, converter: Arc<dyn crate::storage::converting::Converter>) -> Self {
+        self.info.storage_version = Some(api_version.to_string());
+        self.info.converter = Some(converter);
+        self
+    }
+
     pub fn build(self) -> Arc<ResourceInfo> {
         Arc::new(self.info)
     }
 }
 
-/// All resources served by the API server.
+/// All resources served by the API server: the built-in ones registered at
+/// start, plus resources added at runtime (`CustomResourceDefinition`s),
+/// grouped by their owner so that one CRD's versions are swapped atomically.
 #[derive(Default)]
 pub struct Registry {
     resources: Vec<Arc<ResourceInfo>>,
+    dynamic: std::sync::RwLock<BTreeMap<String, Vec<Arc<ResourceInfo>>>>,
 }
 
 impl Registry {
@@ -283,22 +417,47 @@ impl Registry {
         self.resources.push(info);
     }
 
-    pub fn resources(&self) -> &[Arc<ResourceInfo>] {
-        &self.resources
+    /// Replaces every resource registered by `owner` (e.g. a CRD name) at runtime.
+    /// An empty list removes the owner's resources.
+    pub fn set_dynamic(&self, owner: &str, infos: Vec<Arc<ResourceInfo>>) {
+        let mut d = self.dynamic.write().unwrap();
+        if infos.is_empty() {
+            d.remove(owner);
+        } else {
+            d.insert(owner.to_string(), infos);
+        }
+    }
+
+    /// Resources `owner` registered at runtime.
+    pub fn dynamic(&self, owner: &str) -> Vec<Arc<ResourceInfo>> {
+        self.dynamic.read().unwrap().get(owner).cloned().unwrap_or_default()
+    }
+
+    /// Built-in resources followed by runtime-registered ones.
+    pub fn resources(&self) -> Vec<Arc<ResourceInfo>> {
+        let mut out = self.resources.clone();
+        for v in self.dynamic.read().unwrap().values() {
+            out.extend(v.iter().cloned());
+        }
+        out
     }
 
     pub fn lookup(&self, group: &str, version: &str, plural: &str) -> Option<Arc<ResourceInfo>> {
-        self.resources.iter().find(|r| r.group == group && r.version == version && r.plural == plural).cloned()
+        let hit = |r: &&Arc<ResourceInfo>| r.group == group && r.version == version && r.plural == plural;
+        if let Some(r) = self.resources.iter().find(hit) {
+            return Some(r.clone());
+        }
+        self.dynamic.read().unwrap().values().flatten().find(hit).cloned()
     }
 
     pub fn by_kind(&self, group: &str, kind: &str) -> Option<Arc<ResourceInfo>> {
-        self.resources.iter().find(|r| r.group == group && r.kind == kind).cloned()
+        self.resources().into_iter().find(|r| r.group == group && r.kind == kind)
     }
 
     /// group → versions (in registration order).
     pub fn groups(&self) -> BTreeMap<String, Vec<String>> {
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for r in &self.resources {
+        for r in self.resources() {
             let v = out.entry(r.group.clone()).or_default();
             if !v.contains(&r.version) {
                 v.push(r.version.clone());
@@ -309,6 +468,22 @@ impl Registry {
 
     /// All resources of one group/version.
     pub fn group_version(&self, group: &str, version: &str) -> Vec<Arc<ResourceInfo>> {
-        self.resources.iter().filter(|r| r.group == group && r.version == version).cloned().collect()
+        self.resources().into_iter().filter(|r| r.group == group && r.version == version).collect()
+    }
+}
+
+/// Upstream's etcd key prefix of a resource (see [`ResourceInfo::storage_prefix`]).
+pub fn etcd_resource_prefix(group: &str, plural: &str) -> String {
+    match (group, plural) {
+        ("", "nodes") => "minions".into(),
+        ("", "services") => "services/specs".into(),
+        ("", "endpoints") => "services/endpoints".into(),
+        ("", "replicationcontrollers") => "controllers".into(),
+        ("networking.k8s.io", "ingresses") => "ingress".into(),
+        // kube-aggregator keeps its group in the key.
+        ("apiregistration.k8s.io", "apiservices") => "apiregistration.k8s.io/apiservices".into(),
+        // so does apiextensions-apiserver.
+        ("apiextensions.k8s.io", "customresourcedefinitions") => "apiextensions.k8s.io/customresourcedefinitions".into(),
+        (_, p) => p.to_string(),
     }
 }

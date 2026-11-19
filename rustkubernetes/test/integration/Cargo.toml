@@ -10,6 +10,7 @@ publish = false
 k8s-api.workspace = true
 k8s-apimachinery.workspace = true
 k8s-apiserver.workspace = true
+k8s-apiextensions-apiserver.workspace = true
 k8s-client-go.workspace = true
 kube-controlplane.workspace = true
 kube-controller.workspace = true

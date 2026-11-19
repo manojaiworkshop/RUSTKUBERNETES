@@ -3,10 +3,17 @@
 //!
 //! * `GET /healthz`
 //! * `GET /pods` — pods bound to this node
+//! * `GET /metrics/resource` — CPU/memory of the node, pods and containers ([`crate::metrics`])
 //! * `GET /containerLogs/{ns}/{pod}/{container}?follow&tailLines&timestamps&previous&sinceSeconds`
-//! * `GET /exec/{ns}/{pod}/{container}?command=..&stdin&stdout&stderr&tty` — WebSocket using the
+//! * `GET|POST /exec/{ns}/{pod}/{container}?command=..&input=1&output=1&error=1&tty=1` — WebSocket using the
 //!   Kubernetes channel protocol (`v5.channel.k8s.io` / `v4.channel.k8s.io`): every binary message
 //!   starts with a channel byte — 0 stdin, 1 stdout, 2 stderr, 3 status (JSON), 4 resize, 255 close.
+//! * `GET|POST /attach/{ns}/{pod}/{container}?input=1&output=1&error=1` — the container's own stdio, same
+//!   protocol (TTY when the container has `tty: true`).
+//! * exec and attach also accept an `Upgrade: SPDY/3.1` (`v4.channel.k8s.io` … `channel.k8s.io`), see
+//!   [`crate::remotecommand`].
+//! * `POST|GET /portForward/{ns}/{pod}[/{uid}]` — upgraded to SPDY/3.1, protocol `portforward.k8s.io`
+//!   ([`crate::portforward`]).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,16 +39,20 @@ pub fn router(ctx: Arc<KubeletCtx>) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/pods", get(pods))
+        .route("/metrics/resource", get(resource_metrics))
         .route("/containerLogs/{ns}/{pod}/{container}", get(logs))
-        .route("/exec/{ns}/{pod}/{container}", get(exec))
+        .route("/exec/{ns}/{pod}/{container}", get(exec).post(exec))
+        .route("/attach/{ns}/{pod}/{container}", get(attach).post(attach))
+        .route("/portForward/{ns}/{pod}", get(port_forward).post(port_forward))
+        .route("/portForward/{ns}/{pod}/{uid}", get(port_forward_uid).post(port_forward_uid))
         .with_state(ctx)
 }
 
 /// HTTPS settings of the kubelet API (`--tls-cert-file`, `--client-ca-file`, ...).
 #[derive(Clone, Debug)]
 pub struct TlsServing {
-    pub cert: Vec<u8>,
-    pub key: Vec<u8>,
+    /// Serving certificate (`--tls-cert-file`, or rotated with `--rotate-server-certificates`).
+    pub cert: std::sync::Arc<k8s_client_go::util::cert::DynamicCert>,
     /// Verifies client certificates (x509 authentication).
     pub client_ca: Option<Vec<u8>>,
     /// `--anonymous-auth`
@@ -217,6 +228,12 @@ fn err(code: StatusCode, msg: impl Into<String>) -> Response {
     (code, msg.into()).into_response()
 }
 
+/// `GET /metrics/resource` (scraped by metrics-server).
+async fn resource_metrics(State(ctx): State<Arc<KubeletCtx>>) -> Response {
+    let body = crate::metrics::collect(&ctx).await;
+    Response::builder().header("Content-Type", "text/plain; version=0.0.4; charset=utf-8").body(Body::from(body)).unwrap()
+}
+
 async fn pods(State(ctx): State<Arc<KubeletCtx>>) -> Response {
     let items: Vec<Value> = ctx
         .pods
@@ -286,13 +303,83 @@ const CH_ERROR: u8 = 3;
 const CH_RESIZE: u8 = 4;
 const CH_CLOSE: u8 = 255;
 
+/// Upgrade kind of a streaming request.
+fn is_websocket(req: &axum::extract::Request) -> bool {
+    req.headers().get("upgrade").and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+}
+
+/// `httpstream.Handshake`: picks the first client protocol the server supports.
+pub fn negotiate(req: &axum::extract::Request, server: &[&'static str]) -> Result<&'static str, Response> {
+    let values: Vec<String> = req
+        .headers()
+        .get_all(crate::portforward::HEADER_PROTOCOL_VERSION)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(String::from))
+        .collect();
+    if values.is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            format!("unable to upgrade: header {} does not exist in request", crate::portforward::HEADER_PROTOCOL_VERSION),
+        ));
+    }
+    let client: Vec<&str> = values.iter().flat_map(|v| v.split(',')).map(str::trim).filter(|v| !v.is_empty()).collect();
+    match client.iter().find_map(|c| server.iter().find(|s| *s == c)) {
+        Some(p) => Ok(p),
+        None => {
+            let mut r = Response::builder().status(StatusCode::FORBIDDEN);
+            for p in server {
+                r = r.header(crate::portforward::HEADER_ACCEPTED_PROTOCOL_VERSIONS, *p);
+            }
+            Err(r
+                .body(Body::from(format!(
+                    "unable to upgrade: unable to negotiate protocol: client supports {client:?}, server accepts {server:?}"
+                )))
+                .unwrap())
+        }
+    }
+}
+
+/// `spdy.NewResponseUpgrader().UpgradeResponse`: answers 101 and hands the raw
+/// connection to `serve` once hyper completes the upgrade.
+fn spdy_upgrade<F, Fut>(mut req: axum::extract::Request, protocol: &'static str, serve: F) -> Response
+where
+    F: FnOnce(hyper_util::rt::TokioIo<hyper::upgrade::Upgraded>) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let h = req.headers();
+    let connection = h.get("connection").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+    let upgrade = h.get("upgrade").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+    if !connection.contains("upgrade") || !upgrade.contains(&spdystream::HEADER_SPDY31.to_lowercase()) {
+        return err(StatusCode::BAD_REQUEST, format!("unable to upgrade: missing upgrade headers in request: {:?}", req.headers()));
+    }
+    let on_upgrade = hyper::upgrade::on(&mut req);
+    tokio::spawn(async move {
+        match on_upgrade.await {
+            Ok(up) => serve(hyper_util::rt::TokioIo::new(up)).await,
+            Err(e) => tracing::warn!("Unable to upgrade: error hijacking response: {e}"),
+        }
+    });
+    Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", spdystream::HEADER_SPDY31)
+        .header(crate::portforward::HEADER_PROTOCOL_VERSION, protocol)
+        .body(Body::empty())
+        .unwrap()
+}
+
+/// `getExec`: WebSocket (channel protocol) or SPDY streams.
 async fn exec(
     State(ctx): State<Arc<KubeletCtx>>,
     Path((ns, pod, container)): Path<(String, String, String)>,
     RawQuery(q): RawQuery,
-    ws: WebSocketUpgrade,
+    req: axum::extract::Request,
 ) -> Response {
     let pairs = query_pairs(&q);
+    let opts = match crate::remotecommand::Options::from_query(&pairs) {
+        Ok(o) => o,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
     let command: Vec<String> = pairs.iter().filter(|(k, _)| k == "command").map(|(_, v)| v.clone()).collect();
     if command.is_empty() {
         return err(StatusCode::BAD_REQUEST, "you must specify at least one command for the container");
@@ -304,9 +391,110 @@ async fn exec(
     if !running {
         return err(StatusCode::BAD_REQUEST, format!("container {container} is not running"));
     }
-    let tty = flag(&pairs, "tty");
-    let stdin = flag(&pairs, "stdin");
-    ws.protocols(PROTOCOLS).on_upgrade(move |socket| exec_session(ctx, id, command, tty, stdin, socket)).into_response()
+    if is_websocket(&req) {
+        use axum::extract::FromRequest;
+        let ws = match WebSocketUpgrade::from_request(req, &()).await {
+            Ok(ws) => ws,
+            Err(e) => return e.into_response(),
+        };
+        return ws
+            .protocols(PROTOCOLS)
+            .on_upgrade(move |socket| async move {
+                let sess = ctx.runtime.exec_stream(&id, &command, opts.tty, opts.stdin).await;
+                stream_session(ctx, Session::Exec(command), sess, opts, socket).await
+            })
+            .into_response();
+    }
+    let protocol = match negotiate(&req, &crate::remotecommand::SPDY_PROTOCOLS) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let target = crate::remotecommand::Target::Exec { container_id: id, cmd: command };
+    spdy_upgrade(req, protocol, move |io| crate::remotecommand::serve(ctx, protocol, opts, target, io))
+}
+
+/// `getAttach`: the container's main process stdio. The TTY setting comes from the
+/// container spec, as the kubelet passes `container.TTY` to the runtime.
+async fn attach(
+    State(ctx): State<Arc<KubeletCtx>>,
+    Path((ns, pod, container)): Path<(String, String, String)>,
+    RawQuery(q): RawQuery,
+    req: axum::extract::Request,
+) -> Response {
+    let pairs = query_pairs(&q);
+    let mut opts = match crate::remotecommand::Options::from_query(&pairs) {
+        Ok(o) => o,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    let spec = ctx.pods.read().unwrap().as_ref().and_then(|s| s.get_ns(&ns, &pod)).and_then(|p| {
+        p.spec.as_ref()?.containers.iter().find(|c| c.name == container).map(|c| (c.tty.unwrap_or(false), c.stdin.unwrap_or(false)))
+    });
+    let (id, running) = match container_id(&ctx, &ns, &pod, &container, false) {
+        Ok(v) => v,
+        Err(r) => return r,
+    };
+    if !running {
+        return err(StatusCode::BAD_REQUEST, format!("container {container} is not running"));
+    }
+    let (tty, has_stdin) = spec.unwrap_or((false, false));
+    opts.tty = tty;
+    opts.stdin &= has_stdin;
+    if is_websocket(&req) {
+        use axum::extract::FromRequest;
+        let ws = match WebSocketUpgrade::from_request(req, &()).await {
+            Ok(ws) => ws,
+            Err(e) => return e.into_response(),
+        };
+        return ws
+            .protocols(PROTOCOLS)
+            .on_upgrade(move |socket| async move {
+                let sess = ctx.runtime.attach(&id, opts.stdin, opts.tty).await;
+                stream_session(ctx, Session::Attach, sess, opts, socket).await
+            })
+            .into_response();
+    }
+    let protocol = match negotiate(&req, &crate::remotecommand::SPDY_PROTOCOLS) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    let target = crate::remotecommand::Target::Attach { container_id: id };
+    spdy_upgrade(req, protocol, move |io| crate::remotecommand::serve(ctx, protocol, opts, target, io))
+}
+
+async fn port_forward(
+    State(ctx): State<Arc<KubeletCtx>>,
+    Path((ns, pod)): Path<(String, String)>,
+    req: axum::extract::Request,
+) -> Response {
+    port_forward_upgrade(ctx, ns, pod, None, req)
+}
+
+async fn port_forward_uid(
+    State(ctx): State<Arc<KubeletCtx>>,
+    Path((ns, pod, uid)): Path<(String, String, String)>,
+    req: axum::extract::Request,
+) -> Response {
+    port_forward_upgrade(ctx, ns, pod, Some(uid), req)
+}
+
+/// `getPortForward` + `httpstream.Handshake` + `spdy.NewResponseUpgrader`.
+fn port_forward_upgrade(ctx: Arc<KubeletCtx>, ns: String, pod: String, uid: Option<String>, req: axum::extract::Request) -> Response {
+    let found = ctx.pods.read().unwrap().as_ref().and_then(|s| s.get_ns(&ns, &pod));
+    let Some(p) = found else { return err(StatusCode::NOT_FOUND, "pod does not exist") };
+    let pod_uid = p.metadata.uid.clone().unwrap_or_default();
+    if uid.as_ref().is_some_and(|u| *u != pod_uid) {
+        return err(StatusCode::NOT_FOUND, "pod not found");
+    }
+    let protocol = match negotiate(&req, &[crate::portforward::PROTOCOL_V1]) {
+        Ok(p) => p,
+        Err(r) => return r,
+    };
+    spdy_upgrade(req, protocol, move |io| crate::portforward::serve(ctx, pod_uid, io))
+}
+
+enum Session {
+    Exec(Vec<String>),
+    Attach,
 }
 
 fn status_message(code: Option<i32>, cmd: &[String], error: Option<String>) -> Bytes {
@@ -337,10 +525,21 @@ fn frame(ch: u8, data: &[u8]) -> Message {
     Message::Binary(Bytes::from(v))
 }
 
-/// Bridges a WebSocket (channel protocol) and a runtime exec stream.
-async fn exec_session(ctx: Arc<KubeletCtx>, id: String, cmd: Vec<String>, tty: bool, stdin: bool, socket: WebSocket) {
+/// Bridges a WebSocket (channel protocol) and a runtime exec or attach stream.
+async fn stream_session(
+    ctx: Arc<KubeletCtx>,
+    kind: Session,
+    sess: anyhow::Result<crate::runtime::ExecSession>,
+    opts: crate::remotecommand::Options,
+    socket: WebSocket,
+) {
+    let tty = opts.tty;
     let (mut ws_tx, mut ws_rx) = socket.split();
-    let sess = match ctx.runtime.exec_stream(&id, &cmd, tty, stdin).await {
+    let cmd = match &kind {
+        Session::Exec(c) => c.clone(),
+        Session::Attach => vec![],
+    };
+    let sess = match sess {
         Ok(s) => s,
         Err(e) => {
             let _ = ws_tx.send(Message::Binary(status_message(None, &cmd, Some(e.to_string())))).await;
@@ -349,6 +548,7 @@ async fn exec_session(ctx: Arc<KubeletCtx>, id: String, cmd: Vec<String>, tty: b
         }
     };
     let exec_id = sess.exec_id.clone();
+    let attach = matches!(kind, Session::Attach);
     let (mut rd, mut wr) = tokio::io::split(sess.io);
     let rt = ctx.runtime.clone();
     let resize_exec = exec_id.clone();
@@ -372,7 +572,8 @@ async fn exec_session(ctx: Arc<KubeletCtx>, id: String, cmd: Vec<String>, tty: b
                     if let Ok(v) = serde_json::from_slice::<Value>(payload) {
                         let w = v["Width"].as_u64().unwrap_or(80) as u16;
                         let h = v["Height"].as_u64().unwrap_or(24) as u16;
-                        let _ = rt.exec_resize(&resize_exec, w, h).await;
+                        let _ =
+                            if attach { rt.resize_container(&resize_exec, w, h).await } else { rt.exec_resize(&resize_exec, w, h).await };
                     }
                 }
                 CH_CLOSE if payload.first() == Some(&CH_STDIN) => {
@@ -392,7 +593,12 @@ async fn exec_session(ctx: Arc<KubeletCtx>, id: String, cmd: Vec<String>, tty: b
                 let frames: Vec<Message> = if tty {
                     vec![frame(CH_STDOUT, &buf[..n])]
                 } else {
-                    demux.push(&buf[..n]).into_iter().map(|(s, d)| frame(if s == 2 { CH_STDERR } else { CH_STDOUT }, &d)).collect()
+                    demux
+                        .push(&buf[..n])
+                        .into_iter()
+                        .filter(|(s, _)| if *s == 2 { opts.stderr } else { opts.stdout })
+                        .map(|(s, d)| frame(if s == 2 { CH_STDERR } else { CH_STDOUT }, &d))
+                        .collect()
                 };
                 for f in frames {
                     if ws_tx.send(f).await.is_err() {
@@ -405,7 +611,8 @@ async fn exec_session(ctx: Arc<KubeletCtx>, id: String, cmd: Vec<String>, tty: b
     }
     input.abort();
     let mut code = None;
-    for _ in 0..20 {
+    // An attach ends when the container's stdio closes: success (`StatusSuccess`).
+    for _ in 0..if attach { 0 } else { 20 } {
         match ctx.runtime.exec_exit_code(&exec_id).await {
             Ok(Some(c)) => {
                 code = Some(c);

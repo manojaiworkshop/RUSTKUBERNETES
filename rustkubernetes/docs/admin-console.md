@@ -49,7 +49,7 @@ match the host (CSRF). Failed sign-ins are delayed and audited. Every change is 
 | Step | What happens |
 |------|--------------|
 | Add machine | name, IP, transport (`local` or `ssh`), SSH user/port, auth (rustkubeadmin's ed25519 key, a stored private key, or a password via `sshpass`), install directory (default `$HOME/.local/rustkube`, no root needed) |
-| Bundle | `rustkube-bundle.tar.gz` (≈ 78 MiB): 7 release binaries, `rustkube-node`, `install.sh` and `docker save` of `pause:3.10`, `coredns:v1.12.1` and `kube-proxy-base`. Rebuilt when a binary or image changes (fingerprint of sizes, mtimes and image IDs) |
+| Bundle | `rustkube-bundle.tar.gz` (≈ 95 MiB): 7 release binaries plus the static `rustkube-portforward` helper, `rustkube-node`, `install.sh` and `docker save` of `pause:3.10`, `coredns:v1.12.1`, `kube-proxy-base`, `etcd:3.5.21-0`, `flannel:v0.27.4`, `metrics-server:v0.8.0`, `local-path-provisioner:v0.0.32` and `busybox:latest`. One build at a time; concurrent installs wait for it. Rebuilt when a binary or image changes (fingerprint of sizes, mtimes and image IDs) |
 | Copy | `cp` or `scp` to `/tmp/rustkube-bundle-<job>.tar.gz` |
 | Install | `install.sh PREFIX`: checks Linux, architecture and Docker access; installs `bin/*`; `docker load`s the images; picks a supervisor (`systemd` as root, `systemd-user`, otherwise `nohup`); prints `FACT key=value` lines (OS, kernel, CPUs, memory, Docker version, supervisor, prefix, br_netfilter) |
 
@@ -63,12 +63,23 @@ directory.
    `kubeadm node-credentials` (kubelet serving certificate and `kubelet.conf`). `ca.key` never leaves the console.
 2. **Payload per machine** (`<data>/clusters/<name>/payload/<node>`):
    - certificates and kubeconfigs;
-   - one script per service (`kube-apiserver`, `kube-controller-manager`, `kube-scheduler` on the master; `kubelet`
+   - one script per service (`etcd`, `kube-apiserver`, `kube-controller-manager`, `kube-scheduler` on the master; `kubelet`
      and `kube-proxy` on every node);
    - `services/order` and `NODE`.
 3. **Deploy**: tar, copy, unpack into `<prefix>/clusters/<name>`, then `rustkube-node start <name>`. The master goes
    first; the console waits for `/readyz`, deploys the workers, waits until every node is Ready, and applies the
-   CoreDNS add-on.
+   flannel pod network add-on, the CoreDNS add-on and the metrics-server add-on (`kubectl top`; Add-ons checkbox,
+   default on, needs kube-proxy) and the local-path-provisioner add-on (default StorageClass `local-path`, as kind;
+   checkbox, default on). The API server gets kubeadm's front-proxy flags for the aggregation layer and `--enable-bootstrap-token-auth`; the
+   controller manager signs CSRs with the cluster CA (`--cluster-signing-*`), kubelets run with `--rotate-certificates`
+   and the console runs `kubeadm init phase bootstrap-token`, so kubelet client certificates renew themselves. The API server runs with `--authorization-mode Node,RBAC` and
+   `--enable-admission-plugins NodeRestriction`, like kubeadm, so each machine's kubelet credential only reaches that
+   node's own objects ([phase-6e-node-authorization.md](phase-6e-node-authorization.md)).
+   - **Pod network** (Add-ons card): *kubenet + flannel* (default). kube-controller-manager gets
+     `--allocate-node-cidrs --cluster-cidr <pod CIDR>`, kubelets get `--network-plugin kubenet` (+ MTU 1450 for vxlan),
+     kube-proxy gets the pod CIDR and `--hairpin-bridge cbr0`. Choose the flannel backend: *vxlan* (any network) or
+     *host-gw* (machines on one LAN). *Docker bridge* keeps pods on each machine's `docker0` (single-machine
+     clusters). See [phase-6d-pod-network.md](phase-6d-pod-network.md).
 4. **`rustkube-node`** (on the machine): `start`, `stop`, `restart`, `status`, `logs`, `remove`. With systemd it writes
    `rustkube-<cluster>-<service>.service` units with `Restart=always`. Without systemd it runs a `setsid` restart loop
    with a pid file. `stop` also stops the node's pod containers; `remove` deletes them and the cluster directory.
@@ -113,8 +124,9 @@ On this workstation, the following was checked:
 
 ## 7. Limitations
 
-- **Networking**: pods use each machine's Docker bridge, so there is no cross-machine pod network (no CNI). Services
-  reach endpoints on the same machine.
+- **Networking**: kubenet + flannel need Docker ≥ 28 on the machines. Clusters created before Phase 6d keep the
+  Docker bridge (no cross-machine pod traffic) until they are re-created. Deleting a cluster leaves flannel's
+  iptables chains, like `kubeadm reset`.
 - **Concurrency**: one console instance (state in a JSON file). Sessions are lost on restart.
 - **HTTPS**: the console serves plain HTTP; put it behind a TLS proxy (or keep it on loopback) before exposing it.
 - **Prerequisites and systemd**: machines need Docker and a user in the `docker` group. With `systemctl --user`, enable

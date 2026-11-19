@@ -3,6 +3,7 @@
 //! | Module | Go equivalent |
 //! |--------|---------------|
 //! | [`runtime`] | CRI `RuntimeService` / `ImageService` (subset) |
+//! | [`apis`] | `apis`: labels a kubelet may set on its Node |
 //! | [`dns`] | `network/dns`: pod resolver settings |
 //! | [`dockershim`] | `cri-dockerd` / former `pkg/kubelet/dockershim` |
 //! | [`pod_workers`] | `pod_workers.go`, `kuberuntime/kuberuntime_manager.go` |
@@ -10,19 +11,27 @@
 //! | [`prober`] | `prober`, `pkg/probe` |
 //! | [`volumes`] | `pkg/volume/*` (emptyDir, hostPath, configMap, secret, downwardAPI, projected) |
 //! | [`envvars`] | `kubelet_pods.go: makeEnvironmentVariables` |
+//! | [`metrics`] | `metrics/collectors/resource_metrics.go` (`/metrics/resource`) |
 //! | [`nodestatus`] | `kubelet_node_status.go`, node lease |
-//! | [`server`] | `pkg/kubelet/server` (logs, exec) |
+//! | [`server`] | `pkg/kubelet/server` (logs, exec, attach, port-forward) |
+//! | [`remotecommand`] | `cri-streaming/.../remotecommand` (exec/attach over SPDY) |
+//! | [`portforward`] | `cri-streaming/.../portforward` (SPDY port forwarding) |
 //!
 //! [`Kubelet::run`] registers the node, keeps its Lease fresh, watches pods
 //! bound to this node and runs one [`pod_workers::PodWorker`] per pod. A
 //! background relist (PLEG) refreshes the runtime cache every second.
 
+pub mod apis;
+pub mod certificate;
 pub mod dns;
 pub mod dockershim;
 pub mod envvars;
+pub mod metrics;
 pub mod nodestatus;
 pub mod pod_workers;
+pub mod portforward;
 pub mod prober;
+pub mod remotecommand;
 pub mod runtime;
 pub mod server;
 pub mod status;
@@ -58,6 +67,85 @@ pub struct KubeletConfig {
     pub cluster_domain: String,
     /// HTTPS for the kubelet API (`--tls-cert-file` etc.); `None` serves plain HTTP.
     pub tls: Option<server::TlsServing>,
+    /// `--pod-cidr` (standalone mode; the node's `spec.podCIDRs` take over once set).
+    pub pod_cidr: Option<String>,
+}
+
+/// `runtimeState`: what the kubelet last learned from the runtime.
+#[derive(Default)]
+pub struct RuntimeState {
+    pod_cidr: Mutex<String>,
+    network_error: Mutex<Option<String>>,
+    runtime_error: Mutex<Option<String>>,
+    update_pod_cidr: tokio::sync::Mutex<()>,
+}
+
+impl RuntimeState {
+    pub fn pod_cidr(&self) -> String {
+        self.pod_cidr.lock().unwrap().clone()
+    }
+
+    /// `networkErrors`
+    pub fn network_error(&self) -> Option<String> {
+        self.network_error.lock().unwrap().clone()
+    }
+
+    /// `runtimeErrors`
+    pub fn runtime_error(&self) -> Option<String> {
+        self.runtime_error.lock().unwrap().clone()
+    }
+}
+
+/// `updateRuntimeUp`: refreshes the runtime and network readiness from CRI `Status`.
+pub async fn update_runtime_up(ctx: &KubeletCtx) {
+    let conds = match ctx.runtime.status().await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Container runtime sanity check failed: {e:#}");
+            return;
+        }
+    };
+    let find = |t: &str| conds.iter().find(|c| c.type_ == t).cloned();
+    let fmt = |c: Option<runtime::RuntimeCondition>| c.map(|c| c.to_string()).unwrap_or_else(|| "<nil>".into());
+    let network = find(runtime::NETWORK_READY);
+    let net_err = match &network {
+        Some(c) if c.status => None,
+        _ => Some(format!("container runtime network not ready: {}", fmt(network.clone()))),
+    };
+    let runtime_ready = find(runtime::RUNTIME_READY);
+    let rt_err = match &runtime_ready {
+        Some(c) if c.status => None,
+        _ => Some(format!("container runtime not ready: {}", fmt(runtime_ready.clone()))),
+    };
+    let st = &ctx.runtime_state;
+    let prev = st.network_error.lock().unwrap().clone();
+    if net_err != prev {
+        match &net_err {
+            Some(e) => tracing::error!("Container runtime network not ready: {e}"),
+            None => tracing::info!("Container runtime network is ready"),
+        }
+    }
+    *st.network_error.lock().unwrap() = net_err;
+    if let Some(e) = &rt_err {
+        tracing::error!("Container runtime not ready: {e}");
+    }
+    *st.runtime_error.lock().unwrap() = rt_err;
+}
+
+/// `updatePodCIDR`: hands a new pod CIDR to the runtime; returns whether it changed.
+pub async fn update_pod_cidr(ctx: &KubeletCtx, cidr: &str) -> anyhow::Result<bool> {
+    let _g = ctx.runtime_state.update_pod_cidr.lock().await;
+    let current = ctx.runtime_state.pod_cidr();
+    if current == cidr {
+        return Ok(false);
+    }
+    // kubelet -> runtime shim -> network plugin
+    if let Err(e) = ctx.runtime.update_runtime_config(cidr).await {
+        return Err(anyhow::anyhow!("failed to update pod CIDR: {e:#}"));
+    }
+    tracing::info!(original_pod_cidr = %current, new_pod_cidr = cidr, "Updating Pod CIDR");
+    *ctx.runtime_state.pod_cidr.lock().unwrap() = cidr.to_string();
+    Ok(true)
 }
 
 /// Last relist of the runtime (`kubecontainer.Cache` fed by the PLEG).
@@ -99,6 +187,7 @@ pub struct KubeletCtx {
     pub pods: RwLock<Option<Store<Pod>>>,
     pub cluster_dns: Vec<String>,
     pub cluster_domain: String,
+    pub runtime_state: RuntimeState,
 }
 
 pub struct Kubelet {
@@ -122,6 +211,7 @@ impl Kubelet {
             pods: RwLock::new(None),
             cluster_dns: cfg.cluster_dns.clone(),
             cluster_domain: cfg.cluster_domain.clone(),
+            runtime_state: RuntimeState::default(),
         });
         Ok(Self { cfg, ctx })
     }
@@ -179,14 +269,31 @@ impl Kubelet {
     pub async fn run(self: Arc<Self>) -> anyhow::Result<()> {
         let version = self.ctx.runtime.version().await?;
         tracing::info!(node = %self.cfg.node_name, runtime = %version, root = %self.ctx.root.display(), "starting kubelet");
+        if let Some(cidr) = self.cfg.pod_cidr.as_deref().filter(|c| !c.is_empty()) {
+            if let Err(e) = update_pod_cidr(&self.ctx, cidr).await {
+                tracing::error!("{e:#}");
+            }
+        }
+        update_runtime_up(&self.ctx).await;
         nodestatus::register(&self.ctx, &self.cfg, &version).await?;
+
+        // Runtime and network readiness every 5s (`updateRuntimeUp`).
+        let ctx = self.ctx.clone();
+        tokio::spawn(async move {
+            let mut t = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                t.tick().await;
+                update_runtime_up(&ctx).await;
+            }
+        });
 
         // Kubelet API server (logs, exec).
         let addr = format!("0.0.0.0:{}", self.cfg.port);
         let listener = tokio::net::TcpListener::bind(&addr).await?;
         match &self.cfg.tls {
             Some(t) => {
-                let tls = k8s_client_go::util::cert::server_config(&t.cert, &t.key, t.client_ca.as_deref()).map_err(anyhow::Error::msg)?;
+                let tls =
+                    k8s_client_go::util::cert::server_config_dynamic(t.cert.clone(), t.client_ca.as_deref()).map_err(anyhow::Error::msg)?;
                 let srv = server::secure_router(self.ctx.clone(), t.clone());
                 tracing::info!(webhook_authz = t.webhook_authz, x509 = t.client_ca.is_some(), "kubelet server listening on https://{addr}");
                 tokio::spawn(async move {

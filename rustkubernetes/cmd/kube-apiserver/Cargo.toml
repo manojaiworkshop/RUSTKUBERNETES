@@ -11,9 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 k8s-apiserver.workspace = true
+k8s-apiextensions-apiserver.workspace = true
 kube-controlplane.workspace = true
 k8s-client-go.workspace = true
 kube-plugin.workspace = true
+kube-aggregator.workspace = true
 kube-serviceaccount.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

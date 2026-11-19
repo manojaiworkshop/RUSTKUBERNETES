@@ -9,6 +9,7 @@ license.workspace = true
 k8s-api.workspace = true
 k8s-apimachinery.workspace = true
 k8s-apiserver.workspace = true
+k8s-apiextensions-apiserver.workspace = true
 kube-plugin.workspace = true
 kube-registry.workspace = true
 kube-serviceaccount.workspace = true

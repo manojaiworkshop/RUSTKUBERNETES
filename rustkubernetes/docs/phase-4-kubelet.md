@@ -174,9 +174,11 @@ probe scheduling, pod phase/condition generation, exec query decoding and exit s
 
 ## 10. Known limitations
 
-- Single host: pod IPs come from Docker's default bridge; there is no CNI, so pods on different machines cannot
-  reach each other. Service ClusterIPs are not routed yet (kube-proxy is Phase 5).
-- `kubectl attach`, `port-forward` and `cp` are not implemented; the kubelet API has no authentication (bind it to
-  localhost or a trusted network).
-- No eviction manager, image garbage collection, static pods, CSI/PVC volumes or service-account token projection.
+- By default pod IPs come from Docker's default bridge. Since Phase 6d, `--network-plugin=kubenet` puts pods on
+  `cbr0` on the node's pod CIDR, and the flannel add-on connects machines ([phase-6d-pod-network.md](phase-6d-pod-network.md)).
+  Service ClusterIPs are routed by kube-proxy (Phase 5).
+- `kubectl attach`, `port-forward` and `cp` arrived in Phase 6f ([phase-6f-streaming.md](phase-6f-streaming.md)). (The kubelet API gained TLS, authentication and
+  authorization in Phase 6a.)
+- No eviction manager, image garbage collection, static pods or CSI/PVC volumes. (ServiceAccount token projection
+  arrived in Phase 6a.)
 - HTTPS probes are not supported; gRPC probes are reported as successful.

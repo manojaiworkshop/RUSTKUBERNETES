@@ -20,8 +20,12 @@ use rcgen::{
     SanType,
 };
 
-pub const CA_YEARS: i32 = 10;
-pub const CERT_YEARS: i32 = 1;
+/// `CACertificateValidityPeriod`: 10 years.
+pub const CA_VALIDITY: time::Duration = time::Duration::days(365 * 10);
+/// `CertificateValidityPeriod`: 1 year.
+pub const CERT_VALIDITY: time::Duration = time::Duration::days(365);
+/// `CertificateBackdate`
+pub const CERT_BACKDATE: time::Duration = time::Duration::minutes(5);
 
 /// The CA, loaded or created.
 pub struct Ca {
@@ -30,15 +34,19 @@ pub struct Ca {
     pub pem: String,
 }
 
-fn this_year() -> i32 {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    1970 + (secs / 31_556_952) as i32
+/// `NewSelfSignedCACert`: now → now + 10 years.
+fn ca_validity(p: &mut CertificateParams) {
+    let now = time::OffsetDateTime::now_utc();
+    p.not_before = now;
+    p.not_after = now + CA_VALIDITY;
 }
 
-fn validity(p: &mut CertificateParams, years: i32) {
-    let y = this_year();
-    p.not_before = rcgen::date_time_ymd(y - 1, 1, 1);
-    p.not_after = rcgen::date_time_ymd(y + years, 12, 31);
+/// Signed certificates: now − 5 minutes → now + 1 year (kubeadm's renewal window,
+/// also used for new certificates so they never start before the CA).
+fn leaf_validity(p: &mut CertificateParams) {
+    let now = time::OffsetDateTime::now_utc();
+    p.not_before = now - CERT_BACKDATE;
+    p.not_after = now + CERT_VALIDITY;
 }
 
 fn dn(cn: &str, orgs: &[&str]) -> DistinguishedName {
@@ -62,26 +70,36 @@ fn write(path: &Path, data: &str, private: bool) -> Result<()> {
 
 /// Loads `ca.crt`/`ca.key` from `dir`, creating them if missing.
 pub fn ensure_ca(dir: &Path) -> Result<Ca> {
+    ensure_named_ca(dir, "kubernetes", "ca")
+}
+
+/// A CA in `dir` with common name `cn` (`kubernetes`, or `etcd-ca` for `pki/etcd`).
+pub fn ensure_named_ca(dir: &Path, cn: &str, label: &str) -> Result<Ca> {
+    ensure_ca_files(dir, "ca", cn, label)
+}
+
+/// A CA stored as `<dir>/<base>.crt` and `<base>.key` (e.g. `front-proxy-ca`).
+pub fn ensure_ca_files(dir: &Path, base: &str, cn: &str, label: &str) -> Result<Ca> {
     std::fs::create_dir_all(dir)?;
-    let (crt, key) = (dir.join("ca.crt"), dir.join("ca.key"));
+    let (crt, key) = (dir.join(format!("{base}.crt")), dir.join(format!("{base}.key")));
     if crt.exists() && key.exists() {
         let pem = std::fs::read_to_string(&crt)?;
-        let key = KeyPair::from_pem(&std::fs::read_to_string(&key)?).context("parsing ca.key")?;
+        let key = KeyPair::from_pem(&std::fs::read_to_string(&key)?).with_context(|| format!("parsing {base}.key"))?;
         // Re-create an issuer with the same subject and key (signatures stay valid).
-        let cert = CertificateParams::from_ca_cert_pem(&pem).context("parsing ca.crt")?.self_signed(&key)?;
+        let cert = CertificateParams::from_ca_cert_pem(&pem).with_context(|| format!("parsing {base}.crt"))?.self_signed(&key)?;
         return Ok(Ca { cert, key, pem });
     }
     let key = KeyPair::generate()?;
     let mut p = CertificateParams::default();
-    p.distinguished_name = dn("kubernetes", &[]);
+    p.distinguished_name = dn(cn, &[]);
     p.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     p.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign, KeyUsagePurpose::DigitalSignature];
-    validity(&mut p, CA_YEARS);
+    ca_validity(&mut p);
     let cert = p.self_signed(&key)?;
     let pem = cert.pem();
     write(&crt, &pem, false)?;
     write(&key_path(&crt), &key.serialize_pem(), true)?;
-    println!("[certs] Generating \"ca\" certificate and key");
+    println!("[certs] Generating \"{label}\" certificate and key");
     Ok(Ca { cert, key, pem })
 }
 
@@ -117,7 +135,7 @@ pub fn issue(ca: &Ca, spec: &LeafSpec) -> Result<(String, String)> {
     for ip in &spec.ips {
         p.subject_alt_names.push(SanType::IpAddress(*ip));
     }
-    validity(&mut p, CERT_YEARS);
+    leaf_validity(&mut p);
     let cert = p.signed_by(&key, &ca.cert, &ca.key)?;
     Ok((cert.pem(), key.serialize_pem()))
 }
@@ -190,7 +208,50 @@ pub fn all(o: &CertOptions) -> Result<Ca> {
     )?;
     kubelet_serving(o, &ca)?;
     ensure_sa_keys(&o.cert_dir)?;
+    front_proxy(o)?;
+    etcd(o)?;
     Ok(ca)
+}
+
+/// kubeadm's front-proxy PKI for the aggregation layer: `front-proxy-ca`
+/// (CN `front-proxy-ca`) and `front-proxy-client` (CN `front-proxy-client`, client auth),
+/// which the API server presents to extension API servers such as metrics-server.
+pub fn front_proxy(o: &CertOptions) -> Result<()> {
+    let ca = ensure_ca_files(&o.cert_dir, "front-proxy-ca", "front-proxy-ca", "front-proxy-ca")?;
+    ensure_leaf(
+        &o.cert_dir,
+        "front-proxy-client",
+        &ca,
+        &LeafSpec { cn: "front-proxy-client", orgs: &[], dns: vec![], ips: vec![], server: false, client: true },
+    )
+}
+
+/// kubeadm's etcd PKI: `etcd/ca` (CN `etcd-ca`), `etcd/server` and `etcd/peer`
+/// (CN = node name; SANs node name, localhost, node IPs, 127.0.0.1, ::1),
+/// `etcd/healthcheck-client` and `apiserver-etcd-client` (both client certs from the etcd CA).
+pub fn etcd(o: &CertOptions) -> Result<()> {
+    let dir = o.cert_dir.join("etcd");
+    let ca = ensure_named_ca(&dir, "etcd-ca", "etcd/ca")?;
+    let mut ips = vec![o.advertise_address, "127.0.0.1".parse()?, "::1".parse()?];
+    ips.extend(o.node_ips.iter().copied());
+    ips.dedup();
+    let dns = vec![o.node_name.clone(), "localhost".into()];
+    let both = LeafSpec { cn: &o.node_name, orgs: &[], dns, ips, server: true, client: true };
+    ensure_leaf(&dir, "server", &ca, &both)?;
+    ensure_leaf(&dir, "peer", &ca, &both)?;
+    ensure_leaf(
+        &dir,
+        "healthcheck-client",
+        &ca,
+        &LeafSpec { cn: "kube-etcd-healthcheck-client", orgs: &[], dns: vec![], ips: vec![], server: false, client: true },
+    )?;
+    ensure_leaf(
+        &o.cert_dir,
+        "apiserver-etcd-client",
+        &ca,
+        &LeafSpec { cn: "kube-apiserver-etcd-client", orgs: &[], dns: vec![], ips: vec![], server: false, client: true },
+    )?;
+    Ok(())
 }
 
 /// Serving certificate for the kubelet on `node_name` (`kubelet-<node>.crt` or `kubelet.crt`).

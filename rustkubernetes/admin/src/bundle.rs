@@ -5,8 +5,8 @@
 //! rustkube-bundle/
 //!   VERSION, ARCH
 //!   install.sh                 assets/install.sh
-//!   bin/kube-apiserver kube-controller-manager kube-scheduler kubelet kube-proxy kubeadm rkubectl rustkube-node
-//!   images/pause.tar coredns.tar kube-proxy-base.tar     (docker save)
+//!   bin/kube-apiserver kube-controller-manager kube-scheduler kubelet kube-proxy kubeadm rkubectl rustkube-portforward rustkube-node
+//!   images/pause.tar coredns.tar kube-proxy-base.tar etcd.tar   (docker save)
 //! ```
 //!
 //! It is rebuilt only when a binary or image changed (fingerprint of sizes,
@@ -19,13 +19,35 @@ use serde_json::{json, Value};
 
 use crate::jobs::JobHandle;
 
-pub const BINARIES: &[&str] =
-    &["kube-apiserver", "kube-controller-manager", "kube-scheduler", "kubelet", "kube-proxy", "kubeadm", "rkubectl"];
+pub const BINARIES: &[&str] = &[
+    "kube-apiserver",
+    "kube-controller-manager",
+    "kube-scheduler",
+    "kubelet",
+    "kube-proxy",
+    "kubeadm",
+    "rkubectl",
+    "rustkube-portforward",
+];
 pub const IMAGES: &[(&str, &str)] = &[
     ("pause", "registry.k8s.io/pause:3.10"),
     ("coredns", "registry.k8s.io/coredns/coredns:v1.12.1"),
     ("kube-proxy-base", "rustkubernetes/kube-proxy-base:24.04"),
+    ("etcd", ETCD_IMAGE),
+    ("flannel", FLANNEL_IMAGE),
+    ("metrics-server", METRICS_SERVER_IMAGE),
+    ("local-path-provisioner", LOCAL_PATH_PROVISIONER_IMAGE),
+    // Its helper pods create and remove volume directories on the nodes.
+    ("busybox", "busybox:latest"),
 ];
+/// Dynamic node-local volumes (cluster/addons/local-path-storage).
+pub const LOCAL_PATH_PROVISIONER_IMAGE: &str = "rancher/local-path-provisioner:v0.0.32";
+/// The resource metrics add-on (cluster/addons/metrics-server).
+pub const METRICS_SERVER_IMAGE: &str = "registry.k8s.io/metrics-server/metrics-server:v0.8.0";
+/// The pod network add-on (cluster/addons/flannel).
+pub const FLANNEL_IMAGE: &str = "ghcr.io/flannel-io/flannel:v0.27.4";
+/// The etcd image kubeadm uses for this Kubernetes version.
+pub const ETCD_IMAGE: &str = "registry.k8s.io/etcd:3.5.21-0";
 pub const KUBE_PROXY_IMAGE: &str = "rustkubernetes/kube-proxy-base:24.04";
 
 const INSTALL_SH: &str = include_str!("../assets/install.sh");
@@ -34,6 +56,8 @@ const NODE_SH: &str = include_str!("../assets/rustkube-node");
 pub struct Bundle {
     pub binaries: PathBuf,
     pub dir: PathBuf,
+    /// One build at a time: concurrent installs share the stage directory and tarball.
+    pub build_lock: tokio::sync::Mutex<()>,
 }
 
 async fn sh(cmd: &str, args: &[&str]) -> Result<String> {
@@ -81,10 +105,11 @@ impl Bundle {
 
     /// Builds the bundle if needed and returns its path.
     pub async fn ensure(&self, job: &JobHandle) -> Result<PathBuf> {
+        let _building = self.build_lock.lock().await;
         let missing = self.missing_binaries();
         if !missing.is_empty() {
             bail!(
-                "binaries missing in {}: {} (build them with `cargo build --release` or pass --binaries)",
+                "binaries missing in {}: {} (build them with `make admin` or pass --binaries)",
                 self.binaries.display(),
                 missing.join(", ")
             );

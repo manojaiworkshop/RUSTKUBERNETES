@@ -9,21 +9,51 @@ use std::fmt;
 pub enum ErrorKind {
     Required,
     Invalid(String),
+    /// Invalid with a value Go prints unquoted (numbers, `%#v` of byte slices).
+    InvalidRaw(String),
     Duplicate(String),
-    NotSupported { value: String, supported: Vec<String> },
+    NotSupported {
+        value: String,
+        supported: Vec<String>,
+    },
     Forbidden(String),
     TooLong(usize),
+    /// `field.TypeInvalid`: the value is already rendered the way Go prints it.
+    TypeInvalid(String),
+    /// `field.TooMany(actual, max)` (`actual` < 0: omitted).
+    TooMany {
+        actual: i64,
+        max: i64,
+    },
+    /// `field.TooFew(actual, min)`
+    TooFew {
+        actual: i64,
+        min: i64,
+    },
+    /// `field.TooShort(min)`
+    TooShort(i64),
+    /// `field.NotSupported` with a value already rendered like Go (see [`go_value`]).
+    NotSupportedRaw {
+        value: String,
+        supported: Vec<String>,
+    },
+    /// `field.Duplicate` with a value already rendered like Go (see [`go_value`]).
+    DuplicateRaw(String),
 }
 
 impl ErrorKind {
     pub fn reason(&self) -> &'static str {
         match self {
             ErrorKind::Required => "FieldValueRequired",
-            ErrorKind::Invalid(_) => "FieldValueInvalid",
-            ErrorKind::Duplicate(_) => "FieldValueDuplicate",
-            ErrorKind::NotSupported { .. } => "FieldValueNotSupported",
+            ErrorKind::Invalid(_) | ErrorKind::InvalidRaw(_) => "FieldValueInvalid",
+            ErrorKind::Duplicate(_) | ErrorKind::DuplicateRaw(_) => "FieldValueDuplicate",
+            ErrorKind::NotSupported { .. } | ErrorKind::NotSupportedRaw { .. } => "FieldValueNotSupported",
             ErrorKind::Forbidden(_) => "FieldValueForbidden",
             ErrorKind::TooLong(_) => "FieldValueTooLong",
+            ErrorKind::TypeInvalid(_) => "FieldValueTypeInvalid",
+            ErrorKind::TooMany { .. } => "FieldValueTooMany",
+            ErrorKind::TooFew { .. } => "FieldValueTooFew",
+            ErrorKind::TooShort(_) => "FieldValueTooShort",
         }
     }
 }
@@ -43,6 +73,11 @@ impl FieldError {
 
     pub fn invalid(field: impl Into<String>, value: impl fmt::Display, detail: impl Into<String>) -> Self {
         Self { field: field.into(), kind: ErrorKind::Invalid(value.to_string()), detail: detail.into() }
+    }
+
+    /// `field.Invalid` with a non-string value (printed as Go's `%v` / `%#v`, unquoted).
+    pub fn invalid_raw(field: impl Into<String>, value: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self { field: field.into(), kind: ErrorKind::InvalidRaw(value.into()), detail: detail.into() }
     }
 
     pub fn duplicate(field: impl Into<String>, value: impl fmt::Display) -> Self {
@@ -65,18 +100,88 @@ impl FieldError {
         Self { field: field.into(), kind: ErrorKind::TooLong(max), detail: String::new() }
     }
 
+    /// `field.Invalid` with a JSON value, rendered like Go's `ErrorBody`
+    /// (strings quoted, numbers and booleans bare, anything else as JSON).
+    pub fn invalid_json(field: impl Into<String>, value: &serde_json::Value, detail: impl Into<String>) -> Self {
+        Self { field: field.into(), kind: ErrorKind::InvalidRaw(go_value(value)), detail: detail.into() }
+    }
+
+    /// `field.TypeInvalid`
+    pub fn type_invalid(field: impl Into<String>, value: &serde_json::Value, detail: impl Into<String>) -> Self {
+        Self { field: field.into(), kind: ErrorKind::TypeInvalid(go_value(value)), detail: detail.into() }
+    }
+
+    /// `field.NotSupported` with a JSON value.
+    pub fn not_supported_json(field: impl Into<String>, value: &serde_json::Value, supported: Vec<String>) -> Self {
+        Self { field: field.into(), kind: ErrorKind::NotSupportedRaw { value: go_value(value), supported }, detail: String::new() }
+    }
+
+    /// `field.Duplicate` with a JSON value.
+    pub fn duplicate_json(field: impl Into<String>, value: &serde_json::Value) -> Self {
+        Self { field: field.into(), kind: ErrorKind::DuplicateRaw(go_value(value)), detail: String::new() }
+    }
+
+    pub fn too_many(field: impl Into<String>, actual: i64, max: i64) -> Self {
+        Self { field: field.into(), kind: ErrorKind::TooMany { actual, max }, detail: String::new() }
+    }
+
+    pub fn too_few(field: impl Into<String>, actual: i64, min: i64) -> Self {
+        Self { field: field.into(), kind: ErrorKind::TooFew { actual, min }, detail: String::new() }
+    }
+
+    pub fn too_short(field: impl Into<String>, min: i64) -> Self {
+        Self { field: field.into(), kind: ErrorKind::TooShort(min), detail: String::new() }
+    }
+
     /// The message without the field path (used in `StatusCause.message`).
     pub fn message(&self) -> String {
         let base = match &self.kind {
             ErrorKind::Required => "Required value".to_string(),
             ErrorKind::Invalid(v) => format!("Invalid value: {v:?}"),
+            ErrorKind::InvalidRaw(v) => format!("Invalid value: {v}"),
             ErrorKind::Duplicate(v) => format!("Duplicate value: {v:?}"),
+            ErrorKind::DuplicateRaw(v) => format!("Duplicate value: {v}"),
+            ErrorKind::NotSupportedRaw { value, supported } => {
+                let list = supported.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ");
+                if supported.is_empty() {
+                    format!("Unsupported value: {value}")
+                } else {
+                    format!("Unsupported value: {value}: supported values: {list}")
+                }
+            }
             ErrorKind::NotSupported { value, supported } => format!(
                 "Unsupported value: {value:?}: supported values: {}",
                 supported.iter().map(|s| format!("{s:?}")).collect::<Vec<_>>().join(", ")
             ),
             ErrorKind::Forbidden(_) => "Forbidden".to_string(),
-            ErrorKind::TooLong(max) => format!("Too long: may not be more than {max} bytes"),
+            ErrorKind::TooLong(max) => format!("Too long: may not be more than {max} {}", if *max == 1 { "byte" } else { "bytes" }),
+            ErrorKind::TypeInvalid(v) => format!("Invalid value: {v}"),
+            ErrorKind::TooMany { actual, max } => {
+                let what = if *max == 1 { "item" } else { "items" };
+                let msg = if *max >= 0 { format!("must have at most {max} {what}") } else { "has too many items".into() };
+                if *actual >= 0 {
+                    format!("Too many: {actual}: {msg}")
+                } else {
+                    format!("Too many: {msg}")
+                }
+            }
+            ErrorKind::TooFew { actual, min } => {
+                let what = if *min == 1 { "item" } else { "items" };
+                let msg = if *min >= 0 { format!("must have at least {min} {what}") } else { "has too few items".into() };
+                if *actual >= 0 {
+                    format!("Too few: {actual}: {msg}")
+                } else {
+                    format!("Too few: {msg}")
+                }
+            }
+            ErrorKind::TooShort(min) => {
+                let what = if *min == 1 { "character" } else { "characters" };
+                if *min >= 0 {
+                    format!("Too short: must be at least {min} {what}")
+                } else {
+                    "Too short: value is too short".into()
+                }
+            }
         };
         if self.detail.is_empty() {
             base
@@ -93,6 +198,17 @@ impl fmt::Display for FieldError {
 }
 
 pub type ErrorList = Vec<FieldError>;
+
+/// Renders a JSON value the way `field.Error.ErrorBody` prints a `BadValue`:
+/// strings with `%q`, numbers and booleans with `%v`, anything else as JSON.
+pub fn go_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => format!("{s:?}"),
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => v.to_string(),
+        serde_json::Value::Null => "null".into(),
+        _ => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
 
 pub const DNS1123_LABEL_MAX_LEN: usize = 63;
 pub const DNS1123_SUBDOMAIN_MAX_LEN: usize = 253;

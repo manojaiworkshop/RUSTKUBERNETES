@@ -114,7 +114,8 @@ Three host details matter with Docker's bridge as the pod network:
   bridge port it came from, which a Linux bridge only allows with `hairpin_mode` on. Upstream the kubelet sets it
   (`--hairpin-mode=hairpin-veth`). Our kubelet is unprivileged, so kube-proxy does it with
   `--hairpin-bridge docker0` (`bridge link set dev <veth> hairpin on` on each sync).
-- **`--cluster-cidr`** is the Docker bridge subnet (`docker network inspect bridge`). Traffic to a ClusterIP from
+- **`--cluster-cidr`** is the pod network: the Docker bridge subnet (`docker network inspect bridge`), or with
+  kubenet (Phase 6d) the controller-manager's `--cluster-cidr`, with `--hairpin-bridge cbr0`. Traffic to a ClusterIP from
   outside it (the host, the LAN) is masqueraded so replies come back through the node.
 
 ## 4. Flags (`cmd/kube-proxy`)
@@ -160,10 +161,8 @@ What I checked against a live cluster:
 
 ## 6. Known limitations
 
-- **No cluster DNS yet**: pods find Services through the `<NAME>_SERVICE_HOST/PORT` environment variables (CoreDNS
-  is Phase 6).
-- The `kubernetes` Service (10.96.0.1:443) has no endpoints: the API server listens on loopback without TLS. In-cluster
-  API access comes with TLS/auth in Phase 6.
+- Cluster DNS arrived in Phase 6b (CoreDNS add-on).
+- In-cluster API access (`kubernetes.default.svc`) works since Phase 6a.
 - NodePorts were tested from the node itself (LAN and bridge addresses) and from pods. Access from other machines
   is untested. Docker 28+ adds FORWARD rules that drop traffic entering its bridge from other interfaces unless
   Docker published the port, so it may be blocked.

@@ -10,6 +10,7 @@
 
 pub mod apps;
 pub mod batch;
+pub mod certificates;
 pub mod core;
 
 use serde_json::Value;

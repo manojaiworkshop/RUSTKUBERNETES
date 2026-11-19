@@ -11,9 +11,14 @@ pub type ValidateFn = fn(&Value) -> ErrorList;
 pub type ValidateUpdateFn = fn(&Value, &Value) -> ErrorList;
 pub type ColumnsFn = fn() -> Vec<Column>;
 pub type CellsFn = fn(&Value) -> Vec<Value>;
+pub type NameFn = fn(&str) -> Vec<String>;
 
 pub struct SimpleStrategy {
     pub has_status: bool,
+    /// `/status` may change labels and annotations (nodes).
+    pub status_metadata: bool,
+    /// Name validation other than DNS-1123 subdomain.
+    pub name: Option<NameFn>,
     pub defaults: Option<DefaultsFn>,
     pub validate: Option<ValidateFn>,
     pub validate_update: Option<ValidateUpdateFn>,
@@ -23,7 +28,16 @@ pub struct SimpleStrategy {
 
 impl SimpleStrategy {
     pub fn new(has_status: bool) -> Self {
-        Self { has_status, defaults: None, validate: None, validate_update: None, columns: None, cells: None }
+        Self {
+            has_status,
+            status_metadata: false,
+            name: None,
+            defaults: None,
+            validate: None,
+            validate_update: None,
+            columns: None,
+            cells: None,
+        }
     }
 
     pub fn defaults(mut self, f: DefaultsFn) -> Self {
@@ -41,6 +55,16 @@ impl SimpleStrategy {
         self
     }
 
+    pub fn name_validation(mut self, f: NameFn) -> Self {
+        self.name = Some(f);
+        self
+    }
+
+    pub fn status_updates_metadata(mut self) -> Self {
+        self.status_metadata = true;
+        self
+    }
+
     pub fn table(mut self, columns: ColumnsFn, cells: CellsFn) -> Self {
         self.columns = Some(columns);
         self.cells = Some(cells);
@@ -52,6 +76,17 @@ impl SimpleStrategy {
 impl Strategy for SimpleStrategy {
     fn has_status(&self) -> bool {
         self.has_status
+    }
+
+    fn status_updates_metadata(&self) -> bool {
+        self.status_metadata
+    }
+
+    fn validate_name(&self, name: &str) -> Vec<String> {
+        match self.name {
+            Some(f) => f(name),
+            None => k8s_apimachinery::validation::is_dns1123_subdomain(name),
+        }
     }
 
     fn prepare_for_create(&self, obj: &mut Value) {

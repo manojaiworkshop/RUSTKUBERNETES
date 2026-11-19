@@ -13,11 +13,12 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { memory } from "@/lib/format";
 import { useSession } from "@/lib/session";
-import type { Machine, Ports } from "@/lib/types";
+import type { Machine, PodNetwork, Ports } from "@/lib/types";
 
-const DEFAULT_PORTS: Ports = { api: 6443, kubelet: 10250, controller_manager: 10257, scheduler: 10259, proxy_healthz: 10256, proxy_metrics: 10249 };
+const DEFAULT_NETWORK: PodNetwork = { plugin: "kubenet", podCidr: "10.244.0.0/16", backend: "vxlan" };
+const DEFAULT_PORTS: Ports = { api: 6443, kubelet: 10250, controller_manager: 10257, scheduler: 10259, proxy_healthz: 10256, proxy_metrics: 10249, etcd_client: 2379, etcd_peer: 2380, etcd_metrics: 2381 };
 
-function MachineCard({ m, role }: { m: Machine; role: "master" | "worker" }) {
+function MachineCard({ m, role, flannel }: { m: Machine; role: "master" | "worker"; flannel: boolean }) {
   return (
     <div className={cn("rounded-md border p-3", role === "master" ? "border-accent/60 bg-accent/5" : "border-line bg-canvas")}>
       <div className="flex items-center gap-2">
@@ -28,7 +29,7 @@ function MachineCard({ m, role }: { m: Machine; role: "master" | "worker" }) {
       <div className="mt-1 font-mono text-xs text-muted">{m.address}</div>
       <div className="mt-1 text-xs text-muted">{m.facts.cpus ?? "?"} CPUs · {memory(m.facts.memory_kb ? `${m.facts.memory_kb}Ki` : undefined)}</div>
       <div className="mt-2 flex flex-wrap gap-1">
-        {(role === "master" ? ["apiserver", "controller-manager", "scheduler", "kubelet", "kube-proxy"] : ["kubelet", "kube-proxy"]).map((s) => (
+        {[...(role === "master" ? ["etcd", "apiserver", "controller-manager", "scheduler", "kubelet", "kube-proxy"] : ["kubelet", "kube-proxy"]), ...(flannel ? ["flannel"] : [])].map((s) => (
           <span key={s} className="rounded bg-inset px-1.5 py-0.5 font-mono text-[11px]">{s}</span>
         ))}
       </div>
@@ -46,7 +47,10 @@ export function NewClusterPage() {
   const [workers, setWorkers] = useState<string[]>([]);
   const [dns, setDns] = useState(true);
   const [proxy, setProxy] = useState(true);
+  const [metrics, setMetrics] = useState(true);
+  const [storage, setStorage] = useState(true);
   const [ports, setPorts] = useState<Ports>(DEFAULT_PORTS);
+  const [network, setNetwork] = useState<PodNetwork>(DEFAULT_NETWORK);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [jobId, setJobId] = useState<string | null>(null);
@@ -62,7 +66,7 @@ export function NewClusterPage() {
     setBusy(true);
     setError("");
     try {
-      const r = await api<{ job: string }>("/api/clusters", { name, master: masterId, workers: workerMs.map((m) => m.id), dns, kubeProxy: proxy, ports });
+      const r = await api<{ job: string }>("/api/clusters", { name, master: masterId, workers: workerMs.map((m) => m.id), dns, kubeProxy: proxy, metrics, storage, ports, network });
       setJobId(r.job);
     } catch (x) {
       setError((x as Error).message);
@@ -123,14 +127,37 @@ export function NewClusterPage() {
           <Card title="4 · Add-ons">
             <div className="space-y-2">
               <Checkbox label={<><b>CoreDNS</b> <span className="text-muted">— cluster DNS at 10.96.0.10 (service names like <code>web.default.svc</code>)</span></>} checked={dns} onChange={(e) => setDns(e.target.checked)} />
-              <Checkbox label={<><b>kube-proxy</b> <span className="text-muted">— Service ClusterIPs and NodePorts (nftables)</span></>} checked={proxy} onChange={(e) => { setProxy(e.target.checked); if (!e.target.checked) setDns(false); }} />
+              <Checkbox label={<><b>kube-proxy</b> <span className="text-muted">— Service ClusterIPs and NodePorts (nftables)</span></>} checked={proxy} onChange={(e) => { setProxy(e.target.checked); if (!e.target.checked) { setDns(false); setMetrics(false); setStorage(false); } }} />
+              <Checkbox label={<><b>metrics-server</b> <span className="text-muted">— resource metrics for <code>kubectl top</code> (aggregated API metrics.k8s.io)</span></>} checked={metrics} disabled={!proxy} onChange={(e) => setMetrics(e.target.checked)} />
+              <Checkbox label={<><b>local-path-provisioner</b> <span className="text-muted">— default StorageClass <code>local-path</code>: PersistentVolumeClaims get a directory on the pod&apos;s node</span></>} checked={storage} disabled={!proxy} onChange={(e) => setStorage(e.target.checked)} />
+            </div>
+            <div className="mt-4 grid gap-3 sm:grid-cols-3">
+              <Field label="Pod network" hint={network.plugin === "kubenet" ? "each node gets a /24; flannel routes between nodes" : "pods only reach pods on the same machine"}>
+                <Select value={network.plugin} onChange={(e) => setNetwork({ ...network, plugin: e.target.value })}>
+                  <option value="kubenet">kubenet + flannel</option>
+                  <option value="">Docker bridge (single machine)</option>
+                </Select>
+              </Field>
+              {network.plugin === "kubenet" && (
+                <>
+                  <Field label="Pod CIDR" hint="--cluster-cidr; must not overlap your LAN or 10.96.0.0/12">
+                    <Input value={network.podCidr} onChange={(e) => setNetwork({ ...network, podCidr: e.target.value.trim() })} pattern="\d+\.\d+\.\d+\.\d+/\d+" required />
+                  </Field>
+                  <Field label="flannel backend" hint={network.backend === "vxlan" ? "overlay, works across subnets (pod MTU 1450)" : "plain routes, machines on one LAN"}>
+                    <Select value={network.backend} onChange={(e) => setNetwork({ ...network, backend: e.target.value })}>
+                      <option value="vxlan">vxlan</option>
+                      <option value="host-gw">host-gw</option>
+                    </Select>
+                  </Field>
+                </>
+              )}
             </div>
             <details className="mt-4">
               <summary className="cursor-pointer text-sm text-link">Advanced: ports</summary>
               <p className="mt-2 text-xs text-muted">Change these when the machines already run something on the default ports (for example another cluster).</p>
               <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
                 {(Object.keys(DEFAULT_PORTS) as (keyof Ports)[]).map((k) => (
-                  <Field key={k} label={k.replace("_", " ")}><Input type="number" min={1} max={65535} value={ports[k]} onChange={(e) => setPorts({ ...ports, [k]: Number(e.target.value) })} /></Field>
+                  <Field key={k} label={k.replaceAll("_", " ")}><Input type="number" min={1} max={65535} value={ports[k]} onChange={(e) => setPorts({ ...ports, [k]: Number(e.target.value) })} /></Field>
                 ))}
               </div>
             </details>
@@ -141,12 +168,12 @@ export function NewClusterPage() {
             <Card title="Topology">
               {masterM ? (
                 <div className="space-y-3">
-                  <MachineCard m={masterM} role="master" />
+                  <MachineCard m={masterM} role="master" flannel={network.plugin === "kubenet"} />
                   {workerMs.length > 0 && <div className="mx-auto h-4 w-px bg-line" />}
-                  {workerMs.map((m) => <MachineCard key={m.id} m={m} role="worker" />)}
+                  {workerMs.map((m) => <MachineCard key={m.id} m={m} role="worker" flannel={network.plugin === "kubenet"} />)}
                   <div className="rounded-md bg-subtle p-3 text-xs text-muted">
                     API <code className="text-fg">https://{masterM.address}:{ports.api}</code><br />
-                    {1 + workerMs.length} node{workerMs.length ? "s" : ""} · TLS, RBAC and ServiceAccount tokens on · {dns ? "CoreDNS" : "no DNS"} · {proxy ? "kube-proxy" : "no Service proxy"}
+                    {1 + workerMs.length} node{workerMs.length ? "s" : ""} · etcd (mTLS) · TLS, RBAC and ServiceAccount tokens on · {network.plugin === "kubenet" ? `pods ${network.podCidr} (flannel ${network.backend})` : "Docker bridge"} · {dns ? "CoreDNS" : "no DNS"} · {proxy ? "kube-proxy" : "no Service proxy"}{metrics ? " · metrics-server" : ""}{storage ? " · local-path storage" : ""}
                   </div>
                 </div>
               ) : <p className="text-muted">Pick a master.</p>}

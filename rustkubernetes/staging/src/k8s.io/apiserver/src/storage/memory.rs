@@ -78,6 +78,9 @@ impl MemoryStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (BTreeMap::new(), 0),
             Err(e) => return Err(StorageError::Internal(format!("read {path:?}: {e}"))),
         };
+        // Snapshots written before the upstream key layout used `/registry/<plural>.<group>/`.
+        let migrated: BTreeMap<String, Value> = objects.into_iter().map(|(k, v)| (upstream_key(&k), v)).collect();
+        let objects = migrated;
         tracing::info!(objects = objects.len(), revision, path = %path.display(), "loaded storage snapshot");
         let store = Arc::new(Self::build(Some(path), objects, revision));
         let weak = Arc::downgrade(&store);
@@ -259,11 +262,41 @@ impl Storage for MemoryStore {
     }
 }
 
+/// Old key layout → upstream etcd layout (`deployments.apps` → `deployments`,
+/// `nodes` → `minions`, `services` → `services/specs`, `endpoints` → `services/endpoints`).
+pub fn upstream_key(k: &str) -> String {
+    let Some(rest) = k.strip_prefix("/registry/") else { return k.to_string() };
+    let (seg, tail) = rest.split_once('/').unwrap_or((rest, ""));
+    let seg = seg.split('.').next().unwrap_or(seg);
+    let new = match seg {
+        "nodes" => "minions",
+        "endpoints" => "services/endpoints",
+        "services" if !(tail.starts_with("specs/") || tail.starts_with("endpoints/")) => "services/specs",
+        s => s,
+    };
+    format!("/registry/{new}/{tail}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::StreamExt;
     use serde_json::json;
+
+    #[test]
+    fn migrates_old_key_layout() {
+        assert_eq!(upstream_key("/registry/deployments.apps/ns/web"), "/registry/deployments/ns/web");
+        assert_eq!(upstream_key("/registry/nodes/n1"), "/registry/minions/n1");
+        assert_eq!(upstream_key("/registry/services/default/kubernetes"), "/registry/services/specs/default/kubernetes");
+        assert_eq!(upstream_key("/registry/services/specs/default/kubernetes"), "/registry/services/specs/default/kubernetes");
+        assert_eq!(upstream_key("/registry/endpoints/default/kubernetes"), "/registry/services/endpoints/default/kubernetes");
+        assert_eq!(upstream_key("/registry/pods/ns/p"), "/registry/pods/ns/p");
+    }
+
+    #[tokio::test]
+    async fn conformance() {
+        super::super::conformance::run(MemoryStore::new()).await;
+    }
 
     #[tokio::test]
     async fn crud_and_conflicts() {

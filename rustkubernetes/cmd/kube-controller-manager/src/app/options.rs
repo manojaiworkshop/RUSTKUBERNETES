@@ -60,6 +60,90 @@ pub struct Options {
     #[arg(long)]
     pub root_ca_file: Option<std::path::PathBuf>,
 
+    /// Should CIDRs for Pods be allocated and set on the cloud provider / nodes.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub allocate_node_cidrs: bool,
+
+    /// CIDR Range for Pods in cluster (comma separated, one per IP family). Requires --allocate-node-cidrs.
+    #[arg(long, default_value = "")]
+    pub cluster_cidr: String,
+
+    /// Type of CIDR allocator to use.
+    #[arg(long, default_value = "RangeAllocator")]
+    pub cidr_allocator_type: String,
+
+    /// Mask size for node cidr in cluster. Default is 24 for IPv4 and 64 for IPv6.
+    #[arg(long, default_value_t = 0)]
+    pub node_cidr_mask_size: u8,
+
+    /// Mask size for IPv4 node cidr in dual-stack cluster.
+    #[arg(long, default_value_t = 24)]
+    pub node_cidr_mask_size_ipv4: u8,
+
+    /// Mask size for IPv6 node cidr in dual-stack cluster.
+    #[arg(long, default_value_t = 64)]
+    pub node_cidr_mask_size_ipv6: u8,
+
+    /// CIDR Range for Services in cluster (kept out of the pod CIDRs).
+    #[arg(long, default_value = "")]
+    pub service_cluster_ip_range: String,
+
+    /// Secondary CIDR Range for Services in a dual-stack cluster.
+    #[arg(long, default_value = "")]
+    pub secondary_service_cluster_ip_range: String,
+
+    /// Enable HostPath PV provisioning when running without a cloud provider. This allows testing
+    /// and development of provisioning features. HostPath provisioning is not supported in any way,
+    /// won't work in a multi-node cluster, and should not be used for anything other than testing
+    /// or development.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+    pub enable_hostpath_provisioner: bool,
+
+    /// Filename containing a PEM-encoded X509 CA certificate used to issue cluster-scoped certificates.
+    /// If specified, no more specific --cluster-signing-* flag may be specified.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_cert_file: String,
+    /// Filename containing a PEM-encoded RSA or ECDSA private key used to sign cluster-scoped certificates.
+    /// If specified, no more specific --cluster-signing-* flag may be specified.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_key_file: String,
+    /// Filename containing a PEM-encoded X509 CA certificate used to issue certificates for the
+    /// kubernetes.io/kubelet-serving signer. If specified, --cluster-signing-{cert,key}-file must not be set.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_kubelet_serving_cert_file: String,
+    /// Filename containing a PEM-encoded private key used to sign certificates for the kubernetes.io/kubelet-serving signer.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_kubelet_serving_key_file: String,
+    /// Filename containing a PEM-encoded X509 CA certificate used to issue certificates for the
+    /// kubernetes.io/kube-apiserver-client-kubelet signer.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_kubelet_client_cert_file: String,
+    /// Filename containing a PEM-encoded private key used to sign certificates for the kubernetes.io/kube-apiserver-client-kubelet signer.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_kubelet_client_key_file: String,
+    /// Filename containing a PEM-encoded X509 CA certificate used to issue certificates for the
+    /// kubernetes.io/kube-apiserver-client signer.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_kube_apiserver_client_cert_file: String,
+    /// Filename containing a PEM-encoded private key used to sign certificates for the kubernetes.io/kube-apiserver-client signer.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_kube_apiserver_client_key_file: String,
+    /// Filename containing a PEM-encoded X509 CA certificate used to issue certificates for the
+    /// kubernetes.io/legacy-unknown signer.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_legacy_unknown_cert_file: String,
+    /// Filename containing a PEM-encoded private key used to sign certificates for the kubernetes.io/legacy-unknown signer.
+    #[arg(long, default_value = "")]
+    pub cluster_signing_legacy_unknown_key_file: String,
+    /// The max length of duration signed certificates will be given. Individual CSRs may request
+    /// shorter certs by setting spec.expirationSeconds.
+    #[arg(long, default_value = "8760h0m0s", value_parser = k8s_apimachinery::duration::parse_go_duration)]
+    pub cluster_signing_duration: std::time::Duration,
+
+    /// The period for syncing persistent volumes and persistent volume claims (seconds).
+    #[arg(long, default_value_t = 15)]
+    pub pvclaimbinder_sync_period: u64,
+
     /// Re-enqueue every object this often (seconds).
     #[arg(long, default_value_t = 30)]
     pub min_resync_period: u64,

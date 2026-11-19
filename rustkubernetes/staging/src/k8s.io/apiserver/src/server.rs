@@ -65,6 +65,8 @@ pub struct ApiServer {
     pub kubelet_tls: Option<Arc<rustls::ClientConfig>>,
     extra_paths: Vec<(String, Value)>,
     ready: AtomicBool,
+    /// The aggregation layer in front of this server, once started.
+    aggregator: std::sync::OnceLock<Arc<dyn crate::aggregator::Aggregator>>,
 }
 
 impl ApiServer {
@@ -81,7 +83,13 @@ impl ApiServer {
             kubelet_tls: cfg.kubelet_tls,
             extra_paths: cfg.extra_paths,
             ready: AtomicBool::new(false),
+            aggregator: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Puts the aggregation layer in front of this server.
+    pub fn set_aggregator(&self, a: Arc<dyn crate::aggregator::Aggregator>) {
+        let _ = self.aggregator.set(a);
     }
 
     pub fn ctx(&self) -> StrategyContext<'_> {
@@ -117,7 +125,14 @@ impl ApiServer {
         obj: Value,
     ) -> Result<Value, ApiError> {
         let info = self.registry.lookup(group, version, plural).ok_or_else(|| ApiError::internal(format!("unknown resource {plural}")))?;
-        crate::handlers::create_object(self, &info, ns, obj, false).await
+        crate::handlers::create_object(self, &info, ns, obj, false, crate::handlers::FieldValidation::Ignore).await
+    }
+
+    /// Deletes every object of a resource (in all namespaces) on behalf of the
+    /// server, honouring finalizers and strategy hooks (CRD instance cleanup).
+    /// Returns how many objects remain in storage.
+    pub async fn delete_all_internal(self: &Arc<Self>, info: &Arc<crate::ResourceInfo>) -> Result<usize, ApiError> {
+        crate::handlers::delete_all(self, info).await
     }
 
     pub fn router(self: &Arc<Self>) -> Router {
@@ -270,8 +285,12 @@ async fn dispatch(State(s): State<Arc<ApiServer>>, req: axum::extract::Request) 
     let path = uri.path().to_string();
     let q = Query::parse(uri.query());
     let watching = q.flag("watch");
-    let is_upgrade = headers.get("upgrade").and_then(|v| v.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let user = match authn_authz(&s, &parts, &q, is_upgrade).await {
+    let upgrade_hdr = headers.get("upgrade").and_then(|v| v.to_str().ok()).unwrap_or("").to_ascii_lowercase();
+    let is_websocket = upgrade_hdr == "websocket";
+    // `Upgrade: SPDY/3.1` (port-forward from clients that do not tunnel through WebSockets).
+    let is_spdy = upgrade_hdr.contains("spdy/3.1");
+    let is_upgrade = is_websocket || is_spdy;
+    let user = match authn_authz(&s, &parts, &q, is_websocket).await {
         Ok(u) => u,
         Err(e) => {
             tracing::info!(verb = %method, uri = %uri, status = e.code, latency = ?start.elapsed(), "HTTP");
@@ -279,24 +298,28 @@ async fn dispatch(State(s): State<Arc<ApiServer>>, req: axum::extract::Request) 
         }
     };
     let username = user.name.clone();
-    let resp = CURRENT_USER
-        .scope(user, async {
-            if is_upgrade {
-                match upgrade(&s, &mut parts, &path, &q).await {
+    let (mut resp, warnings) = crate::warning::scope(CURRENT_USER.scope(user, async {
+        if is_upgrade {
+            match upgrade(&s, &mut parts, &path, &q, is_websocket).await {
+                Ok(r) => r,
+                Err(e) => error_response(&e),
+            }
+        } else {
+            match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
+                Ok(body) => match route(&s, &method, &path, &q, &headers, body).await {
                     Ok(r) => r,
                     Err(e) => error_response(&e),
-                }
-            } else {
-                match axum::body::to_bytes(body, 64 * 1024 * 1024).await {
-                    Ok(body) => match route(&s, &method, &path, &q, &headers, body).await {
-                        Ok(r) => r,
-                        Err(e) => error_response(&e),
-                    },
-                    Err(e) => error_response(&ApiError::bad_request(format!("reading body: {e}"))),
-                }
+                },
+                Err(e) => error_response(&ApiError::bad_request(format!("reading body: {e}"))),
             }
-        })
-        .await;
+        }
+    }))
+    .await;
+    for w in warnings {
+        if let Ok(v) = axum::http::HeaderValue::from_str(&crate::warning::header_value(&w)) {
+            resp.headers_mut().append("warning", v);
+        }
+    }
     let ua = headers.get("user-agent").and_then(|h| h.to_str().ok()).unwrap_or("");
     let level_info = !(path.ends_with("z") || method == Method::GET && !watching);
     if level_info {
@@ -307,16 +330,24 @@ async fn dispatch(State(s): State<Arc<ApiServer>>, req: axum::extract::Request) 
     resp
 }
 
-/// WebSocket upgrades: `pods/exec` and `pods/attach` are relayed to the kubelet.
-async fn upgrade(s: &Arc<ApiServer>, parts: &mut axum::http::request::Parts, path: &str, q: &Query) -> Result<Response, ApiError> {
+/// Upgrades to the kubelet: `pods/exec` and `pods/attach` (WebSocket channel
+/// protocol, relayed frame by frame) and `pods/portforward` (SPDY, either tunnelled
+/// through a WebSocket or upgraded directly; relayed byte for byte).
+async fn upgrade(
+    s: &Arc<ApiServer>,
+    parts: &mut axum::http::request::Parts,
+    path: &str,
+    q: &Query,
+    websocket: bool,
+) -> Result<Response, ApiError> {
     use axum::extract::FromRequestParts;
     let RequestTarget::Resource(req) = parse_path(path) else {
-        return Err(ApiError::bad_request("upgrade requests are only supported for pods/exec and pods/attach"));
+        return Err(ApiError::bad_request("upgrade requests are only supported for pods/exec, pods/attach and pods/portforward"));
     };
     let (Some(name), Some(sub)) = (req.name.as_deref(), req.subresource.as_deref()) else {
         return Err(ApiError::bad_request("upgrade requests need a subresource"));
     };
-    if sub != "exec" && sub != "attach" {
+    if !matches!(sub, "exec" | "attach" | "portforward") {
         return Err(ApiError::bad_request(format!("upgrade is not supported for {sub}")));
     }
     let info = s
@@ -324,6 +355,45 @@ async fn upgrade(s: &Arc<ApiServer>, parts: &mut axum::http::request::Parts, pat
         .lookup(&req.group, &req.version, &req.resource)
         .ok_or_else(|| ApiError::new(404, "NotFound", "the server could not find the requested resource"))?;
     let url = crate::handlers::connect_url(s, &info, &req.namespace, name, sub, q).await?;
+    let backend_error = |(code, msg): (u16, String)| {
+        Response::builder().status(code).header("Content-Type", "text/plain; charset=utf-8").body(axum::body::Body::from(msg)).unwrap()
+    };
+    let header_values = |h: &str| -> Vec<String> {
+        parts
+            .headers
+            .get_all(h)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+            .collect()
+    };
+    if sub == "portforward" && websocket {
+        let spdy = crate::proxy::spdy_protocols_from_websocket(&header_values("sec-websocket-protocol"));
+        if spdy.is_empty() {
+            return Err(ApiError::bad_request("unable to upgrade: no tunneling spdy protocols provided"));
+        }
+        let ws = axum::extract::ws::WebSocketUpgrade::from_request_parts(parts, &())
+            .await
+            .map_err(|e| ApiError::bad_request(format!("invalid websocket upgrade: {e}")))?;
+        return Ok(match crate::proxy::dial_spdy(&url, &spdy, s.kubelet_tls.clone()).await {
+            Ok(b) => crate::proxy::tunnel_websocket(ws, b),
+            Err(e) => backend_error(e),
+        });
+    }
+    if !websocket {
+        // The client upgrades to SPDY itself: proxy the upgrade (`UpgradeAwareHandler`).
+        let protocols = header_values("x-stream-protocol-version");
+        let on_upgrade = parts
+            .extensions
+            .remove::<hyper::upgrade::OnUpgrade>()
+            .ok_or_else(|| ApiError::internal("unable to upgrade: the connection cannot be upgraded"))?;
+        return Ok(match crate::proxy::dial_spdy(&url, &protocols, s.kubelet_tls.clone()).await {
+            Ok(b) => crate::proxy::passthrough_spdy(on_upgrade, b),
+            Err(e) => backend_error(e),
+        });
+    }
     let ws = axum::extract::ws::WebSocketUpgrade::from_request_parts(parts, &())
         .await
         .map_err(|e| ApiError::bad_request(format!("invalid websocket upgrade: {e}")))?;
@@ -332,13 +402,33 @@ async fn upgrade(s: &Arc<ApiServer>, parts: &mut axum::http::request::Parts, pat
 
 async fn route(s: &Arc<ApiServer>, method: &Method, path: &str, q: &Query, headers: &HeaderMap, body: Bytes) -> Result<Response, ApiError> {
     match path {
-        "/healthz" | "/livez" => return Ok("ok".into_response()),
-        "/readyz" => {
-            return Ok(if s.ready.load(Ordering::SeqCst) {
-                "ok".into_response()
-            } else {
-                (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "[-]bootstrap not finished\nreadyz check failed").into_response()
-            });
+        // Upstream health checks: `/livez` (ping), `/healthz` and `/readyz` (ping, etcd, bootstrap).
+        "/livez" => return Ok("ok".into_response()),
+        "/healthz" | "/readyz" => {
+            let verbose = q.0.contains_key("verbose");
+            let mut checks: Vec<(&str, Result<(), String>)> = vec![("ping", Ok(()))];
+            checks.push(("etcd", s.storage.check().await.map_err(|e| e.to_string())));
+            if path == "/readyz" {
+                let boot = if s.ready.load(Ordering::SeqCst) { Ok(()) } else { Err("not finished".to_string()) };
+                checks.push(("poststarthook/bootstrap-controller", boot));
+            }
+            let failed = checks.iter().any(|(_, r)| r.is_err());
+            if !failed && !verbose {
+                return Ok("ok".into_response());
+            }
+            let mut body = String::new();
+            for (name, r) in &checks {
+                match r {
+                    Ok(()) => body.push_str(&format!("[+]{name} ok\n")),
+                    Err(e) => {
+                        tracing::warn!(check = name, "{} check failed: {e}", &path[1..]);
+                        body.push_str(&format!("[-]{name} failed: reason withheld\n"));
+                    }
+                }
+            }
+            body.push_str(&format!("{} check {}\n", &path[1..], if failed { "failed" } else { "passed" }));
+            let code = if failed { axum::http::StatusCode::INTERNAL_SERVER_ERROR } else { axum::http::StatusCode::OK };
+            return Ok((code, body).into_response());
         }
         "/version" => return Ok(json_response(200, &s.version)),
         p if s.extra_paths.iter().any(|(x, _)| x == p) => {
@@ -374,9 +464,28 @@ async fn route(s: &Arc<ApiServer>, method: &Method, path: &str, q: &Query, heade
         let ver = s.version.get("gitVersion").and_then(Value::as_str).unwrap_or("");
         return openapi::group_version(&s.registry, gv_path, ver).map(|v| json_response(200, &v)).ok_or_else(not_found);
     }
+    // Groups served by extension API servers (APIServices with a service).
+    if let (Some(a), Some(rest)) = (s.aggregator.get(), path.strip_prefix("/apis/")) {
+        let group = rest.split('/').next().unwrap_or("");
+        if !group.is_empty() && !s.registry.groups().contains_key(group) {
+            if let Some(user) = crate::authentication::current_user() {
+                let req =
+                    crate::aggregator::AggregatedRequest { method, path, raw_query: q.raw(), headers, body: body.clone(), user: &user };
+                if let Some(r) = a.serve(req).await {
+                    return r;
+                }
+            }
+        }
+    }
     match parse_path(path) {
         RequestTarget::ApiVersions => Ok(json_response(200, &discovery::api_versions(&s.advertise_address))),
-        RequestTarget::ApiGroupList => Ok(json_response(200, &discovery::api_group_list(&s.registry))),
+        RequestTarget::ApiGroupList => {
+            let mut list = discovery::api_group_list(&s.registry);
+            if let (Some(a), Some(groups)) = (s.aggregator.get(), list.get_mut("groups").and_then(Value::as_array_mut)) {
+                groups.extend(a.api_groups());
+            }
+            Ok(json_response(200, &list))
+        }
         RequestTarget::ApiGroup(g) => discovery::api_group(&s.registry, &g).map(|v| json_response(200, &v)).ok_or_else(not_found),
         RequestTarget::ResourceList { group, version } => {
             discovery::api_resource_list(&s.registry, &group, &version).map(|v| json_response(200, &v)).ok_or_else(not_found)

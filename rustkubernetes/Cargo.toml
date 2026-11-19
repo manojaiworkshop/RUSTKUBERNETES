@@ -27,6 +27,12 @@ members = [
     "cmd/kube-proxy",
     "cmd/kubeadm",
     "cmd/kubectl",
+    # vendored third-party libraries (k8s: vendor/)
+    "vendor/go.etcd.io/etcd/client/v3",
+    "vendor/github.com/moby/spdystream",
+    "staging/src/k8s.io/kube-aggregator",
+    "staging/src/k8s.io/component-helpers",
+    "staging/src/k8s.io/apiextensions-apiserver",
     # web console (rustkubeadmin)
     "admin",
     # tests
@@ -54,6 +60,11 @@ kube-kubemark = { path = "pkg/kubemark" }
 kube-kubelet = { path = "pkg/kubelet" }
 kube-proxy-core = { path = "pkg/proxy" }
 kube-serviceaccount = { path = "pkg/serviceaccount" }
+etcd-clientv3 = { path = "vendor/go.etcd.io/etcd/client/v3" }
+spdystream = { path = "vendor/github.com/moby/spdystream" }
+kube-aggregator = { path = "staging/src/k8s.io/kube-aggregator" }
+k8s-component-helpers = { path = "staging/src/k8s.io/component-helpers" }
+k8s-apiextensions-apiserver = { path = "staging/src/k8s.io/apiextensions-apiserver" }
 kube-plugin = { path = "plugin" }
 
 # external crates

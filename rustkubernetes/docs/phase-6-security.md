@@ -67,8 +67,8 @@ Code: `staging/src/k8s.io/apiserver/src/{server,authentication,authorization,imp
 4. **Authorization**: request attributes use upstream's `RequestInfo` verbs (get, list, watch, create, update,
    patch, delete, deletecollection; exec over WebSocket counts as `create`). The authorizer chain is:
    - `system:masters` → allow;
-   - then `--authorization-mode` (default `Node,RBAC` with TLS). `Node` is satisfied by the `system:node`
-     ClusterRole; there is no separate node authorizer yet.
+   - then `--authorization-mode` (default `Node,RBAC` with TLS). `Node` is the Node authorizer
+     ([phase-6e-node-authorization.md](phase-6e-node-authorization.md)).
 
    Forbidden messages match upstream word for word.
 5. Then admission and the handlers. The user is available to handlers through a task-local (`current_user()`).
@@ -185,8 +185,6 @@ What the e2e checks cover:
 
 ## 10. Known limitations
 
-- No etcd yet (6c): state is the in-memory store with JSON snapshots.
-- No Node authorizer or NodeRestriction admission: a kubelet credential can read every Secret.
 - No certificate rotation, CSR API or kubelet TLS bootstrap; kubeadm issues 1-year leaf certificates.
 - No OIDC user authentication, webhook token authentication for the API server, audit logging or API Priority
   and Fairness.

@@ -56,6 +56,9 @@ pub struct TlsClientConfig {
     pub key_data: Option<Vec<u8>>,
     /// Skip server certificate verification (`insecure-skip-tls-verify`).
     pub insecure: bool,
+    /// A client certificate that can change at runtime (kubelet certificate
+    /// rotation, `transport.Config.TLS.GetCert`); wins over `cert_data`.
+    pub cert_resolver: Option<Arc<DynamicCert>>,
 }
 
 impl std::fmt::Debug for TlsClientConfig {
@@ -65,6 +68,7 @@ impl std::fmt::Debug for TlsClientConfig {
             .field("cert_data", &self.cert_data.as_ref().map(|_| "<pem>"))
             .field("key_data", &self.key_data.as_ref().map(|_| "<redacted>"))
             .field("insecure", &self.insecure)
+            .field("cert_resolver", &self.cert_resolver.is_some())
             .finish()
     }
 }
@@ -82,6 +86,7 @@ impl TlsClientConfig {
             builder.with_root_certificates(root_store(ca)?)
         };
         let mut cfg = match (&self.cert_data, &self.key_data) {
+            _ if self.cert_resolver.is_some() => builder.with_client_cert_resolver(self.cert_resolver.clone().unwrap()),
             (Some(c), Some(k)) => {
                 builder.with_client_auth_cert(parse_certs(c)?, parse_key(k)?).map_err(|e| format!("client certificate: {e}"))?
             }
@@ -109,6 +114,71 @@ pub fn server_config(cert_pem: &[u8], key_pem: &[u8], client_ca: Option<&[u8]>) 
     let mut cfg = builder.with_single_cert(parse_certs(cert_pem)?, parse_key(key_pem)?).map_err(|e| format!("serving certificate: {e}"))?;
     cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(cfg)
+}
+
+/// Server TLS config whose certificate comes from `cert` at every handshake
+/// (rotated kubelet serving certificates).
+pub fn server_config_dynamic(cert: Arc<DynamicCert>, client_ca: Option<&[u8]>) -> Result<ServerConfig, String> {
+    let builder = ServerConfig::builder_with_provider(provider()).with_safe_default_protocol_versions().map_err(|e| e.to_string())?;
+    let builder = match client_ca {
+        Some(ca) => {
+            let verifier = WebPkiClientVerifier::builder_with_provider(Arc::new(root_store(ca)?), provider())
+                .allow_unauthenticated()
+                .build()
+                .map_err(|e| format!("client CA: {e}"))?;
+            builder.with_client_cert_verifier(verifier)
+        }
+        None => builder.with_no_client_auth(),
+    };
+    let mut cfg = builder.with_cert_resolver(cert);
+    cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(cfg)
+}
+
+/// A certificate and key that can be replaced while connections use it.
+#[derive(Default)]
+pub struct DynamicCert {
+    current: std::sync::RwLock<Option<Arc<rustls::sign::CertifiedKey>>>,
+}
+
+impl std::fmt::Debug for DynamicCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicCert").field("loaded", &self.current().is_some()).finish()
+    }
+}
+
+impl DynamicCert {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Replaces the certificate (PEM chain) and key (PEM).
+    pub fn set(&self, cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
+        let certs = parse_certs(cert_pem)?;
+        let key = provider().key_provider.load_private_key(parse_key(key_pem)?).map_err(|e| format!("loading private key: {e}"))?;
+        *self.current.write().unwrap() = Some(Arc::new(rustls::sign::CertifiedKey::new(certs, key)));
+        Ok(())
+    }
+
+    pub fn current(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.current.read().unwrap().clone()
+    }
+}
+
+impl rustls::client::ResolvesClientCert for DynamicCert {
+    fn resolve(&self, _hints: &[&[u8]], _schemes: &[SignatureScheme]) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.current()
+    }
+
+    fn has_certs(&self) -> bool {
+        self.current().is_some()
+    }
+}
+
+impl rustls::server::ResolvesServerCert for DynamicCert {
+    fn resolve(&self, _hello: rustls::server::ClientHello<'_>) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.current()
+    }
 }
 
 /// Accepts any server certificate (signatures are still checked).

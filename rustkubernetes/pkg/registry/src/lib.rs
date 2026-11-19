@@ -13,10 +13,13 @@
 //! | [`apps`]               | deployments, replicasets, daemonsets, statefulsets |
 //! | [`generic`]            | table-driven strategy for simple resources         |
 
+pub mod apiregistration;
 pub mod apps;
 pub mod authentication;
 pub mod authorization;
 pub mod batch;
+pub mod certificates;
 pub mod core;
 pub mod generic;
 pub mod rbac;
+pub mod storage;

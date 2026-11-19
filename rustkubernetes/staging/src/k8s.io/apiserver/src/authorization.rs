@@ -30,9 +30,18 @@ pub struct Attributes {
     pub name: String,
     /// Request path for non-resource requests (`/healthz`, `/api`).
     pub path: String,
+    /// `fieldSelector` of list/watch requests (`GetFieldSelector`).
+    pub field_selector: String,
+    /// `labelSelector` of list/watch requests (`GetLabelSelector`).
+    pub label_selector: String,
 }
 
 impl Attributes {
+    /// Exact-match requirements of the field selector (`field=value` / `field==value`).
+    pub fn field_requirements(&self) -> Vec<(&str, &str)> {
+        selector_terms(&self.field_selector)
+    }
+
     /// `pods` or `pods/log`.
     pub fn resource_with_sub(&self) -> String {
         if self.subresource.is_empty() {
@@ -169,11 +178,16 @@ pub fn request_attributes(user: &UserInfo, method: &Method, path: &str, q: &Quer
                 _ => "",
             }
             .to_string();
-            // A watch on one object (`?fieldSelector=metadata.name=x`) is a watch of that name.
-            if a.verb == "watch" && !named {
-                if let Some(n) = q.get("fieldSelector").and_then(|f| f.strip_prefix("metadata.name=")) {
-                    if !n.contains(',') {
-                        a.name = n.to_string();
+            if a.verb == "list" || a.verb == "watch" {
+                a.field_selector = q.get("fieldSelector").unwrap_or_default().to_string();
+                a.label_selector = q.get("labelSelector").unwrap_or_default().to_string();
+                // A list/watch of one object (`?fieldSelector=metadata.name=x`) names it
+                // (`RequestInfoFactory`: `FieldSelector.RequiresExactMatch("metadata.name")`).
+                if !named {
+                    if let Some((_, n)) = a.field_requirements().into_iter().find(|(f, _)| *f == "metadata.name") {
+                        if !n.is_empty() && !n.contains('/') && n != "." && n != ".." {
+                            a.name = n.to_string();
+                        }
                     }
                 }
             }
@@ -183,6 +197,20 @@ pub fn request_attributes(user: &UserInfo, method: &Method, path: &str, q: &Quer
         }
     }
     a
+}
+
+/// `field=value` and `field==value` terms of a selector (`!=` terms are skipped).
+pub fn selector_terms(sel: &str) -> Vec<(&str, &str)> {
+    sel.split(',')
+        .filter_map(|t| {
+            let t = t.trim();
+            if t.contains("!=") {
+                return None;
+            }
+            let (k, v) = t.split_once("==").or_else(|| t.split_once('='))?;
+            Some((k.trim(), v.trim()))
+        })
+        .collect()
 }
 
 /// The 403 a client sees (`responsewriters.Forbidden`).

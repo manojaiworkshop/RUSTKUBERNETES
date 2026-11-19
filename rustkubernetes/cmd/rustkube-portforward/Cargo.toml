@@ -1,0 +1,16 @@
+# Built on its own (not a workspace member) as a fully static binary, so it can run in a container made from
+# the pause image, which has no libc:  hack/build-portforward-helper.sh  (called by the hack/ scripts and `make`).
+[package]
+name = "rustkube-portforward"
+description = "Port-forward helper of the rustkubernetes dockershim: stdin/stdout <-> localhost:PORT inside a pod's network namespace"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+
+[profile.release]
+opt-level = "s"
+strip = true
+
+[workspace]

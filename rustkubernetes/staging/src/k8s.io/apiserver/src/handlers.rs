@@ -94,6 +94,44 @@ fn dry_run(q: &Query) -> bool {
     q.get("dryRun") == Some("All")
 }
 
+/// `?fieldValidation=`: what to do about fields the schema does not declare.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldValidation {
+    Ignore,
+    /// The default: each unknown field becomes a `Warning` header.
+    Warn,
+    Strict,
+}
+
+impl FieldValidation {
+    fn from_query(q: &Query) -> Result<Self, ApiError> {
+        match q.get("fieldValidation").unwrap_or("") {
+            "" | "Warn" => Ok(Self::Warn),
+            "Ignore" => Ok(Self::Ignore),
+            "Strict" => Ok(Self::Strict),
+            other => Err(ApiError::bad_request(format!(
+                "fieldValidation parameter unsupported: {other:?}. Supported values: Ignore, Warn, Strict"
+            ))),
+        }
+    }
+
+    /// Reports `unknown` fields (`schemaCoercingDecoder` + `addStrictDecodingWarnings`).
+    fn check(self, unknown: Vec<String>) -> Result<(), ApiError> {
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        let errs: Vec<String> = unknown.iter().map(|f| format!("unknown field \"{f}\"")).collect();
+        match self {
+            Self::Ignore => Ok(()),
+            Self::Warn => {
+                errs.into_iter().for_each(crate::warning::add);
+                Ok(())
+            }
+            Self::Strict => Err(ApiError::bad_request(format!("strict decoding error: {}", errs.join(", ")))),
+        }
+    }
+}
+
 /// Everything except metadata/status: if this changes, `generation` is bumped.
 fn spec_part(obj: &Value) -> Value {
     let mut o = obj.clone();
@@ -143,6 +181,9 @@ pub async fn handle_resource(
     if !info.namespaced && !req.namespace.is_empty() {
         return Err(ApiError::new(404, "NotFound", "the server could not find the requested resource"));
     }
+    if let Some(w) = info.strategy.request_warning() {
+        crate::warning::add(w);
+    }
     let ns = req.namespace.as_str();
     if info.strategy.is_virtual() {
         return match (&req.name, method.clone()) {
@@ -180,9 +221,9 @@ pub async fn handle_resource(
                 return Err(ApiError::new(404, "NotFound", "the server could not find the requested resource"));
             }
             match (sub.as_str(), method.clone()) {
-                ("status", Method::GET) => get(s, &info, ns, name, q, headers).await,
-                ("status", Method::PUT) => update_status(s, &info, ns, name, q, headers, body).await,
-                ("status", Method::PATCH) => patch(s, &info, ns, name, Some("status"), q, headers, body).await,
+                ("status" | "approval", Method::GET) => get(s, &info, ns, name, q, headers).await,
+                ("status" | "approval", Method::PUT) => update_status(s, &info, ns, name, sub, q, headers, body).await,
+                ("status" | "approval", Method::PATCH) => patch(s, &info, ns, name, Some(sub), q, headers, body).await,
                 ("finalize", Method::PUT) => update_finalize(s, &info, ns, name, q, headers, body).await,
                 ("log", Method::GET) => {
                     let url = connect_url(s, &info, ns, name, "log", q).await?;
@@ -203,7 +244,7 @@ pub async fn handle_resource(
 // ---------------------------------------------------------------------------
 
 async fn get(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, ns: &str, name: &str, q: &Query, headers: &HeaderMap) -> HandlerResult {
-    let obj = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let obj = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
     if wants_table(&accept(headers)) {
         let rv = obj.resource_version().to_string();
         let t = build_table(
@@ -222,7 +263,7 @@ async fn get(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, ns: &str, name: &str,
 
 async fn list(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, ns: &str, q: &Query, headers: &HeaderMap) -> HandlerResult {
     let filter = Filter::from_query(q)?;
-    let (items, rev) = s.storage.list(&info.prefix(ns)).await.map_err(|e| storage_err(info, "", e))?;
+    let (items, rev) = info.store(&s.storage).list(&info.prefix(ns)).await.map_err(|e| storage_err(info, "", e))?;
     let mut items: Vec<Value> = items.into_iter().filter(|o| filter.matches(o)).collect();
 
     // Pagination: the continue token is the storage key of the last returned item.
@@ -310,13 +351,13 @@ async fn watch(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, ns: &str, q: &Query
 
     // "" / "0" (or sendInitialEvents): synthetic ADDED events for the current state first.
     let (initial, start) = if rv_param.is_empty() || rv_param == "0" || send_initial {
-        let (items, rev) = s.storage.list(&prefix).await.map_err(|e| storage_err(info, "", e))?;
+        let (items, rev) = info.store(&s.storage).list(&prefix).await.map_err(|e| storage_err(info, "", e))?;
         (items.into_iter().filter(|o| filter.matches(o)).collect::<Vec<_>>(), rev)
     } else {
         (vec![], parse_rv(rv_param).map_err(ApiError::bad_request)?.unwrap_or(0))
     };
 
-    let storage_stream = s.storage.watch(&prefix, start).await;
+    let storage_stream = info.store(&s.storage).watch(&prefix, start).await;
     let info = info.clone();
     let kind = info.kind.clone();
     let api_version = info.api_version();
@@ -455,8 +496,10 @@ pub(crate) async fn create_object(
     ns: &str,
     mut obj: Value,
     dry: bool,
+    fv: FieldValidation,
 ) -> Result<Value, ApiError> {
     check_type(info, &mut obj)?;
+    fv.check(info.strategy.unknown_fields(&obj))?;
     // namespace
     if info.namespaced {
         let body_ns = obj.namespace().to_string();
@@ -465,6 +508,9 @@ pub(crate) async fn create_object(
         }
         let effective = if ns.is_empty() { body_ns } else { ns.to_string() };
         obj.metadata_mut().insert("namespace".into(), json!(effective));
+    } else {
+        // `BeforeCreate`: a namespace on a cluster-scoped object is dropped.
+        obj.metadata_mut().remove("namespace");
     }
     // generateName
     if obj.name().is_empty() {
@@ -517,7 +563,7 @@ pub(crate) async fn create_object(
         return Ok(obj);
     }
     info.strategy.before_create(&ctx, &mut obj).await?;
-    match s.storage.create(&info.key(&namespace, &name), obj.clone()).await {
+    match info.store(&s.storage).create(&info.key(&namespace, &name), obj.clone()).await {
         Ok(created) => Ok(created),
         Err(e) => {
             info.strategy.rollback_create(&ctx, &obj).await;
@@ -528,7 +574,7 @@ pub(crate) async fn create_object(
 
 async fn create(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, ns: &str, q: &Query, headers: &HeaderMap, body: Bytes) -> HandlerResult {
     let obj = decode_body(s, headers, &body)?;
-    let created = create_object(s, info, ns, obj, dry_run(q)).await?;
+    let created = create_object(s, info, ns, obj, dry_run(q), FieldValidation::from_query(q)?).await?;
     Ok(json_response(201, &created))
 }
 
@@ -542,9 +588,13 @@ enum UpdateMode {
     Status,
     /// `namespaces/<name>/finalize`: only `spec.finalizers` may change.
     Finalize,
+    /// `certificatesigningrequests/<name>/approval`: like `status`, the strategy
+    /// keeps only the conditions.
+    Approval,
 }
 
 /// Runs the update pipeline for `new` replacing `old` and persists it.
+#[allow(clippy::too_many_arguments)]
 async fn update_object(
     s: &Arc<ApiServer>,
     info: &Arc<ResourceInfo>,
@@ -553,10 +603,14 @@ async fn update_object(
     expected: Option<u64>,
     mode: UpdateMode,
     dry: bool,
+    fv: FieldValidation,
 ) -> Result<Value, ApiError> {
     let name = old.name().to_string();
     let namespace = old.namespace().to_string();
     check_type(info, &mut new)?;
+    if mode != UpdateMode::Finalize {
+        fv.check(info.strategy.unknown_fields(&new))?;
+    }
     if !new.name().is_empty() && new.name() != name {
         return Err(ApiError::bad_request(format!("the name of the object ({}) does not match the name on the URL ({name})", new.name())));
     }
@@ -567,11 +621,27 @@ async fn update_object(
         new = old.clone();
         new["spec"]["finalizers"] = fins;
         new.metadata_mut().insert("resourceVersion".into(), json!(rv));
-    } else if mode == UpdateMode::Status {
+    } else if matches!(mode, UpdateMode::Status | UpdateMode::Approval) {
         // Only .status may change through /status (ResetObjectMetaForStatus).
         let status = new.get("status").cloned();
         let rv = new.resource_version().to_string();
+        let meta = info.strategy.status_updates_metadata().then(|| {
+            let m = new.get("metadata");
+            (m.and_then(|m| m.get("labels")).cloned(), m.and_then(|m| m.get("annotations")).cloned())
+        });
         new = old.clone();
+        if let Some((labels, annotations)) = meta {
+            for (k, v) in [("labels", labels), ("annotations", annotations)] {
+                match v {
+                    Some(v) => {
+                        new.metadata_mut().insert(k.into(), v);
+                    }
+                    None => {
+                        new.metadata_mut().remove(k);
+                    }
+                }
+            }
+        }
         match status {
             Some(st) => new["status"] = st,
             None => {
@@ -612,8 +682,11 @@ async fn update_object(
         let g = old.pointer("/metadata/generation").and_then(Value::as_i64).unwrap_or(0) + 1;
         new.metadata_mut().insert("generation".into(), json!(g));
     }
-    if mode == UpdateMode::Main {
-        info.strategy.prepare_for_update(&mut new, old);
+    match mode {
+        UpdateMode::Main => info.strategy.prepare_for_update(&mut new, old),
+        UpdateMode::Status => info.strategy.prepare_for_subresource_update("status", &mut new, old),
+        UpdateMode::Approval => info.strategy.prepare_for_subresource_update("approval", &mut new, old),
+        UpdateMode::Finalize => {}
     }
 
     let ctx = s.ctx();
@@ -624,6 +697,7 @@ async fn update_object(
             UpdateMode::Main => None,
             UpdateMode::Status => Some("status"),
             UpdateMode::Finalize => Some("finalize"),
+            UpdateMode::Approval => Some("approval"),
         },
         namespace: &namespace,
         name: &name,
@@ -635,6 +709,7 @@ async fn update_object(
     errs.extend(match mode {
         UpdateMode::Main => info.strategy.validate_update(&new, old),
         UpdateMode::Status => info.strategy.validate_status_update(&new, old),
+        UpdateMode::Approval => info.strategy.validate_approval_update(&new, old),
         UpdateMode::Finalize => vec![],
     });
     // A deleting object may not gain finalizers back once they are all gone; a
@@ -662,7 +737,7 @@ async fn update_object(
     }
     info.strategy.before_update(&ctx, &mut new, old).await?;
     let key = info.key(&namespace, &name);
-    let updated = s.storage.update(&key, expected, new).await.map_err(|e| storage_err(info, &name, e))?;
+    let updated = info.store(&s.storage).update(&key, expected, new).await.map_err(|e| storage_err(info, &name, e))?;
     finalize_if_ready(s, info, updated).await
 }
 
@@ -685,25 +760,28 @@ async fn update(
     body: Bytes,
 ) -> HandlerResult {
     let new = decode_body(s, headers, &body)?;
-    let old = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let old = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
     let expected = parse_rv(new.resource_version()).map_err(ApiError::bad_request)?;
-    let out = update_object(s, info, &old, new, expected, UpdateMode::Main, dry_run(q)).await?;
+    let out = update_object(s, info, &old, new, expected, UpdateMode::Main, dry_run(q), FieldValidation::from_query(q)?).await?;
     Ok(json_response(200, &out))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn update_status(
     s: &Arc<ApiServer>,
     info: &Arc<ResourceInfo>,
     ns: &str,
     name: &str,
+    sub: &str,
     q: &Query,
     headers: &HeaderMap,
     body: Bytes,
 ) -> HandlerResult {
     let new = decode_body(s, headers, &body)?;
-    let old = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let old = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
     let expected = parse_rv(new.resource_version()).map_err(ApiError::bad_request)?;
-    let out = update_object(s, info, &old, new, expected, UpdateMode::Status, dry_run(q)).await?;
+    let mode = if sub == "approval" { UpdateMode::Approval } else { UpdateMode::Status };
+    let out = update_object(s, info, &old, new, expected, mode, dry_run(q), FieldValidation::from_query(q)?).await?;
     Ok(json_response(200, &out))
 }
 
@@ -717,15 +795,28 @@ async fn update_finalize(
     body: Bytes,
 ) -> HandlerResult {
     let new = decode_body(s, headers, &body)?;
-    let old = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let old = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
     let expected = parse_rv(new.resource_version()).map_err(ApiError::bad_request)?;
-    let out = update_object(s, info, &old, new, expected, UpdateMode::Finalize, dry_run(q)).await?;
+    let out = update_object(s, info, &old, new, expected, UpdateMode::Finalize, dry_run(q), FieldValidation::Ignore).await?;
     Ok(json_response(200, &out))
 }
 
 // ---------------------------------------------------------------------------
 // patch
 // ---------------------------------------------------------------------------
+
+/// The patch type of a `PATCH` request, if the resource accepts it.
+fn patch_type(info: &ResourceInfo, ct: &str) -> Result<PatchType, ApiError> {
+    let pt = PatchType::from_content_type(ct);
+    if !info.strategy.supports_strategic_merge_patch() && !matches!(pt, Some(PatchType::Json | PatchType::Merge | PatchType::Apply)) {
+        return Err(ApiError::new(
+            415,
+            "UnsupportedMediaType",
+            "the body of the request was in an unknown format - accepted media types include: application/json-patch+json, application/merge-patch+json, application/apply-patch+yaml",
+        ));
+    }
+    pt.ok_or_else(|| ApiError::unsupported_media_type(ct))
+}
 
 #[allow(clippy::too_many_arguments)]
 async fn patch(
@@ -739,18 +830,23 @@ async fn patch(
     body: Bytes,
 ) -> HandlerResult {
     let ct = headers.get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("");
-    let pt = PatchType::from_content_type(ct).ok_or_else(|| ApiError::unsupported_media_type(ct))?;
-    let mode = if sub == Some("status") { UpdateMode::Status } else { UpdateMode::Main };
+    let pt = patch_type(info, ct)?;
+    let fv = FieldValidation::from_query(q)?;
+    let mode = match sub {
+        Some("status") => UpdateMode::Status,
+        Some("approval") => UpdateMode::Approval,
+        _ => UpdateMode::Main,
+    };
     let key = info.key(ns, name);
     for _ in 0..5 {
-        let old = match s.storage.get(&key).await {
+        let old = match info.store(&s.storage).get(&key).await {
             Ok(o) => o,
             Err(StorageError::NotFound(_)) if pt == PatchType::Apply && mode == UpdateMode::Main => {
                 // Server-side apply creates the object if it does not exist.
                 let mut obj: Value =
                     serde_yaml::from_slice(&body).map_err(|e| ApiError::bad_request(format!("invalid apply patch: {e}")))?;
                 obj.metadata_mut().insert("name".into(), json!(name));
-                let created = create_object(s, info, ns, obj, dry_run(q)).await?;
+                let created = create_object(s, info, ns, obj, dry_run(q), fv).await?;
                 return Ok(json_response(201, &created));
             }
             Err(e) => return Err(storage_err(info, name, e)),
@@ -764,7 +860,7 @@ async fn patch(
             parse_rv(old.resource_version()).ok().flatten()
         };
         patched.metadata_mut().insert("resourceVersion".into(), json!(old.resource_version()));
-        match update_object(s, info, &old, patched, expected, mode, dry_run(q)).await {
+        match update_object(s, info, &old, patched, expected, mode, dry_run(q), fv).await {
             Ok(out) => return Ok(json_response(200, &out)),
             Err(e) if e.is_conflict() && !explicit_rv => continue,
             Err(e) => return Err(e),
@@ -777,12 +873,26 @@ async fn patch(
 // scale subresource (autoscaling/v1 Scale)
 // ---------------------------------------------------------------------------
 
-fn to_scale(obj: &Value) -> Value {
-    let selector = obj
-        .pointer("/spec/selector/matchLabels")
-        .and_then(Value::as_object)
-        .map(|m| m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(","))
-        .unwrap_or_default();
+fn to_scale(info: &ResourceInfo, obj: &Value) -> Value {
+    use crate::registry::{json_path_pointer, ScaleSelector};
+    let paths = info.strategy.scale_paths();
+    let selector = match &paths.selector {
+        ScaleSelector::SpecMatchLabels => obj
+            .pointer("/spec/selector/matchLabels")
+            .and_then(Value::as_object)
+            .map(|m| m.iter().map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or(""))).collect::<Vec<_>>().join(","))
+            .unwrap_or_default(),
+        ScaleSelector::Path(Some(p)) => obj.pointer(&json_path_pointer(p)).and_then(Value::as_str).unwrap_or("").to_string(),
+        ScaleSelector::Path(None) => String::new(),
+    };
+    // Workloads default `spec.replicas` to 1; custom resources report a missing value as 0.
+    let missing = if matches!(paths.selector, ScaleSelector::SpecMatchLabels) { 1 } else { 0 };
+    let mut status = json!({"replicas": obj.pointer(&json_path_pointer(&paths.status_replicas)).cloned().unwrap_or(json!(0))});
+    if !selector.is_empty() {
+        status["selector"] = json!(selector);
+    } else if matches!(paths.selector, ScaleSelector::SpecMatchLabels) {
+        status["selector"] = json!("");
+    }
     json!({
         "kind": "Scale",
         "apiVersion": "autoscaling/v1",
@@ -790,17 +900,31 @@ fn to_scale(obj: &Value) -> Value {
             "name": obj.name(), "namespace": obj.namespace(), "uid": obj.uid(),
             "resourceVersion": obj.resource_version(), "creationTimestamp": obj.creation_timestamp(),
         },
-        "spec": {"replicas": obj.pointer("/spec/replicas").cloned().unwrap_or(json!(1))},
-        "status": {
-            "replicas": obj.pointer("/status/replicas").cloned().unwrap_or(json!(0)),
-            "selector": selector,
-        },
+        "spec": {"replicas": obj.pointer(&json_path_pointer(&paths.spec_replicas)).cloned().unwrap_or(json!(missing))},
+        "status": status,
     })
 }
 
+/// Sets the value at a dotted JSON path, creating intermediate objects.
+fn set_json_path(obj: &mut Value, path: &str, v: Value) {
+    let mut cur = obj;
+    let parts: Vec<&str> = path.split('.').filter(|p| !p.is_empty()).collect();
+    for (i, p) in parts.iter().enumerate() {
+        if !cur.is_object() {
+            *cur = json!({});
+        }
+        let m = cur.as_object_mut().unwrap();
+        if i == parts.len() - 1 {
+            m.insert(p.to_string(), v);
+            return;
+        }
+        cur = m.entry(p.to_string()).or_insert_with(|| json!({}));
+    }
+}
+
 async fn get_scale(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, ns: &str, name: &str) -> HandlerResult {
-    let obj = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
-    Ok(json_response(200, &to_scale(&obj)))
+    let obj = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    Ok(json_response(200, &to_scale(info, &obj)))
 }
 
 async fn apply_scale(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, old: &Value, scale: &Value, dry: bool) -> HandlerResult {
@@ -812,9 +936,9 @@ async fn apply_scale(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, old: &Value, 
     }
     let expected = parse_rv(scale.resource_version()).map_err(ApiError::bad_request)?;
     let mut new = old.clone();
-    new["spec"]["replicas"] = json!(replicas);
-    let out = update_object(s, info, old, new, expected, UpdateMode::Main, dry).await?;
-    Ok(json_response(200, &to_scale(&out)))
+    set_json_path(&mut new, &info.strategy.scale_paths().spec_replicas, json!(replicas));
+    let out = update_object(s, info, old, new, expected, UpdateMode::Main, dry, FieldValidation::Ignore).await?;
+    Ok(json_response(200, &to_scale(info, &out)))
 }
 
 async fn update_scale(
@@ -827,7 +951,7 @@ async fn update_scale(
     body: Bytes,
 ) -> HandlerResult {
     let scale = decode_body(s, headers, &body)?;
-    let old = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let old = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
     apply_scale(s, info, &old, &scale, dry_run(q)).await
 }
 
@@ -842,8 +966,8 @@ async fn patch_scale(
 ) -> HandlerResult {
     let ct = headers.get("content-type").and_then(|h| h.to_str().ok()).unwrap_or("");
     let pt = PatchType::from_content_type(ct).ok_or_else(|| ApiError::unsupported_media_type(ct))?;
-    let old = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
-    let mut scale = apply_patch(&to_scale(&old), pt, &body)?;
+    let old = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let mut scale = apply_patch(&to_scale(info, &old), pt, &body)?;
     scale.metadata_mut().remove("resourceVersion");
     apply_scale(s, info, &old, &scale, dry_run(q)).await
 }
@@ -861,9 +985,22 @@ async fn create_subresource(
     headers: &HeaderMap,
     body: Bytes,
 ) -> HandlerResult {
-    let body = decode_body(s, headers, &body)?;
-    let obj = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let mut body = decode_body(s, headers, &body)?;
+    let obj = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
     let ctx = s.ctx();
+    // Subresource creates (binding, eviction, token) are admitted like any create; the
+    // request body is the object and the parent is the old object.
+    let attrs = Attributes {
+        operation: Operation::Create,
+        resource: info,
+        subresource: Some(sub),
+        namespace: ns,
+        name,
+        old_object: Some(&obj),
+        dry_run: false,
+    };
+    s.admission.admit(&attrs, &mut body, &ctx).await?;
+    s.admission.validate(&attrs, &body, &ctx).await?;
     match info.strategy.create_subresource(&ctx, sub, &obj, body).await {
         Some(Ok(v)) => Ok(json_response(201, &v)),
         Some(Err(e)) => Err(e),
@@ -880,7 +1017,11 @@ pub(crate) async fn remove_object(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, 
     let ctx = s.ctx();
     info.strategy.before_delete(&ctx, obj).await?;
     let expected = parse_rv(obj.resource_version()).ok().flatten();
-    let deleted = s.storage.delete(&info.key(obj.namespace(), obj.name()), expected).await.map_err(|e| storage_err(info, obj.name(), e))?;
+    let deleted = info
+        .store(&s.storage)
+        .delete(&info.key(obj.namespace(), obj.name()), expected)
+        .await
+        .map_err(|e| storage_err(info, obj.name(), e))?;
     info.strategy.after_delete(&ctx, &deleted).await;
     Ok(deleted)
 }
@@ -976,7 +1117,7 @@ async fn delete_one(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, old: Value, op
             let m = marked.metadata_mut();
             m.insert("deletionTimestamp".into(), json!(when.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)));
             m.insert("deletionGracePeriodSeconds".into(), json!(grace));
-            return s.storage.update(&key, expected, marked).await.map_err(|e| storage_err(info, &name, e));
+            return info.store(&s.storage).update(&key, expected, marked).await.map_err(|e| storage_err(info, &name, e));
         }
     }
     // Propagation policy (garbage collector finalizers): Foreground waits for
@@ -1014,7 +1155,7 @@ async fn delete_one(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>, old: Value, op
             m.insert("finalizers".into(), json!(finalizers));
         }
         info.strategy.on_delete_marked(&mut marked);
-        return s.storage.update(&key, expected, marked).await.map_err(|e| storage_err(info, &name, e));
+        return info.store(&s.storage).update(&key, expected, marked).await.map_err(|e| storage_err(info, &name, e));
     }
     remove_object(s, info, &old).await
 }
@@ -1029,7 +1170,7 @@ async fn delete(
     body: Bytes,
 ) -> HandlerResult {
     let opts = DeleteOptions::parse(s, q, headers, &body)?;
-    let old = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let old = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
     let out = delete_one(s, info, old, &opts).await?;
     Ok(json_response(200, &out))
 }
@@ -1044,7 +1185,7 @@ async fn delete_collection(
 ) -> HandlerResult {
     let filter = Filter::from_query(q)?;
     let opts = DeleteOptions::parse(s, q, headers, &body)?;
-    let (items, _) = s.storage.list(&info.prefix(ns)).await.map_err(|e| storage_err(info, "", e))?;
+    let (items, _) = info.store(&s.storage).list(&info.prefix(ns)).await.map_err(|e| storage_err(info, "", e))?;
     let mut deleted = vec![];
     for obj in items.into_iter().filter(|o| filter.matches(o)) {
         match delete_one(s, info, obj, &opts).await {
@@ -1064,6 +1205,21 @@ async fn delete_collection(
     ))
 }
 
+/// `deletecollection` across all namespaces, as the server itself.
+pub(crate) async fn delete_all(s: &Arc<ApiServer>, info: &Arc<ResourceInfo>) -> Result<usize, ApiError> {
+    let opts = DeleteOptions { grace_period: None, propagation: None, precondition_uid: None, precondition_rv: None, dry_run: false };
+    let (items, _) = info.store(&s.storage).list(&info.prefix("")).await.map_err(|e| storage_err(info, "", e))?;
+    for obj in items {
+        match delete_one(s, info, obj, &opts).await {
+            Ok(_) => {}
+            Err(e) if e.is_not_found() => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let (left, _) = info.store(&s.storage).list(&info.prefix("")).await.map_err(|e| storage_err(info, "", e))?;
+    Ok(left.len())
+}
+
 /// Asks the resource's strategy where a CONNECT subresource lives (e.g. the kubelet).
 pub(crate) async fn connect_url(
     s: &Arc<ApiServer>,
@@ -1073,7 +1229,7 @@ pub(crate) async fn connect_url(
     sub: &str,
     q: &Query,
 ) -> Result<String, ApiError> {
-    let obj = s.storage.get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
+    let obj = info.store(&s.storage).get(&info.key(ns, name)).await.map_err(|e| storage_err(info, name, e))?;
     let raw: String = q.0.iter().map(|(k, v)| format!("{}={}", enc(k), enc(v))).collect::<Vec<_>>().join("&");
     let raw = q.raw().map(String::from).unwrap_or(raw);
     match info.strategy.connect(&s.ctx(), sub, &obj, &raw).await {

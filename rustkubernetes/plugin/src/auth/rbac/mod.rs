@@ -22,10 +22,11 @@ use k8s_apiserver::authorization::{Attributes, Authorizer, Decision, RuleSet};
 use k8s_apiserver::Storage;
 use serde_json::{json, Value};
 
-const ROLES: &str = "/registry/roles.rbac.authorization.k8s.io/";
-const CLUSTER_ROLES: &str = "/registry/clusterroles.rbac.authorization.k8s.io/";
-const ROLE_BINDINGS: &str = "/registry/rolebindings.rbac.authorization.k8s.io/";
-const CLUSTER_ROLE_BINDINGS: &str = "/registry/clusterrolebindings.rbac.authorization.k8s.io/";
+// Upstream etcd layout: `/registry/<resource>/...` (no group in the key).
+const ROLES: &str = "/registry/roles/";
+const CLUSTER_ROLES: &str = "/registry/clusterroles/";
+const ROLE_BINDINGS: &str = "/registry/rolebindings/";
+const CLUSTER_ROLE_BINDINGS: &str = "/registry/clusterrolebindings/";
 
 #[derive(Default)]
 struct Index {

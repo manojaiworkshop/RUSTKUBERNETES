@@ -214,6 +214,14 @@ pub struct HttpGetAction {
     pub port: IntOrString,
     pub host: Option<String>,
     pub scheme: Option<String>,
+    pub http_headers: Option<Vec<HttpHeader>>,
+}
+
+/// `HTTPHeader`: a custom header for HTTP probes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct HttpHeader {
+    pub name: String,
+    pub value: String,
 }
 
 #[skip_serializing_none]
@@ -703,3 +711,38 @@ mod tests {
         assert_eq!(Pod::PLURAL, "pods");
     }
 }
+
+// ---------------------------------------------------------------------------
+// PersistentVolume / PersistentVolumeClaim
+// ---------------------------------------------------------------------------
+//
+// `spec` and `status` are kept as JSON: controllers read the fields they need
+// (helpers in `k8s-component-helpers`) and write objects back without losing any.
+
+/// `PersistentVolume`: a piece of storage in the cluster.
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolume {
+    pub api_version: Option<String>,
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    pub spec: Option<Value>,
+    pub status: Option<Value>,
+}
+impl_resource!(PersistentVolume, "", "v1", "PersistentVolume", "persistentvolumes", false);
+
+/// `PersistentVolumeClaim`: a user's request for storage.
+#[skip_serializing_none]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentVolumeClaim {
+    pub api_version: Option<String>,
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub metadata: ObjectMeta,
+    pub spec: Option<Value>,
+    pub status: Option<Value>,
+}
+impl_resource!(PersistentVolumeClaim, "", "v1", "PersistentVolumeClaim", "persistentvolumeclaims", true);

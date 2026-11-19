@@ -1,4 +1,4 @@
-# Testing guide (through Phase 6b)
+# Testing guide (through Phase 6j)
 
 Every command here has been run against the rustkubernetes binaries with the official `kubectl` (v1.35).
 
@@ -7,8 +7,10 @@ Every command here has been run against the rustkubernetes binaries with the off
 ```bash
 cd ~/Documents/KUBERNETES/rustkubernetes
 make build          # build everything
-make test           # 120 unit + integration tests (apiserver, auth, RBAC, controllers, scheduler, kubelet, proxy)
-hack/test-cmd.sh    # 39 checks with the official kubectl against the real binaries (hollow nodes)
+make test           # 195 unit + integration tests (apiserver, auth, RBAC, controllers, scheduler, kubelet, proxy)
+hack/test-cmd.sh    # 54 checks with the official kubectl against the real binaries (hollow nodes)
+make test-etcd      # storage conformance + kubectl suite against a real etcd
+make test-e2e-network  # two machines: node IPAM, kubenet, flannel, cross-node pods/Services/DNS
 make test-e2e-node  # 59 checks on a secure cluster: pods, Services, RBAC, tokens, kubelet auth, CoreDNS
 make verify         # fmt + clippy + all tests + kubectl checks
 ```
@@ -181,6 +183,161 @@ kubectl exec client -- nslookup web.default.svc.cluster.local
 kubectl exec client -- wget -qO- http://web
 ```
 
+## 3d. etcd (Phase 6c)
+
+```bash
+hack/local-up-cluster.sh                    # etcd runs in a container (data in _output/local/etcd)
+ENCRYPT_SECRETS=1 hack/local-up-cluster.sh  # also encrypt Secrets at rest
+kubectl get --raw '/readyz?verbose'         # [+]etcd ok
+EC="docker exec rustkube-etcd-$(hostname | tr A-Z a-z) etcdctl --endpoints https://127.0.0.1:2379 \
+  --cacert /etc/kubernetes/pki/etcd/ca.crt --cert /etc/kubernetes/pki/etcd/healthcheck-client.crt \
+  --key /etc/kubernetes/pki/etcd/healthcheck-client.key"
+$EC get --prefix /registry --keys-only | head          # /registry/minions/…, /registry/services/specs/…
+kubectl create secret generic demo --from-literal=pw=s3cret
+$EC get /registry/secrets/default/demo --print-value-only | head -c 40   # k8s:enc:aesgcm:v1:key1:… (encrypted)
+# Stop the cluster (Ctrl-C) and start it again: everything is still there.
+```
+
+## 3e. Pod network across machines (Phase 6d)
+
+```bash
+make test-e2e-network                       # 36 checks, vxlan; BACKEND=host-gw for the other backend
+KEEP=1 ID=dev hack/test-e2e-network.sh      # leave the two machines running to explore
+export KUBECONFIG=$(pwd)/_output/test-e2e-network/run-dev/admin.conf
+kubectl get nodes -o custom-columns=NAME:.metadata.name,CIDR:.spec.podCIDR
+kubectl get pods -A -o wide                 # flannel on n1 and n2
+docker exec rk-dev-n1 ip route             # 10.244.x.0/24 via ... dev flannel.1
+ID=dev hack/test-e2e-network.sh --cleanup
+```
+
+On a real multi-machine cluster (rustkubeadmin), pods get IPs from each node's `spec.podCIDR`. Check with:
+
+```bash
+kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"  "}{.spec.podCIDR}{"\n"}{end}'
+kubectl run a --image=busybox:1.36 --overrides='{"spec":{"nodeName":"<node-1>"}}' -- sleep 3600
+kubectl run b --image=busybox:1.36 --overrides='{"spec":{"nodeName":"<node-2>"}}' -- sleep 3600
+kubectl exec a -- ping -c 3 $(kubectl get pod b -o jsonpath='{.status.podIP}')
+```
+
+## 3f. Node authorization (Phase 6e)
+
+Act as the kubelet with its own kubeconfig (local-up writes `_output/local/kubelet.conf`):
+
+```bash
+KL="kubectl --kubeconfig _output/local/kubelet.conf"
+$KL get node $(hostname | tr A-Z a-z)          # its own Node: allowed
+$KL get nodes                                   # forbidden: cannot read all nodes, only its own Node object
+kubectl create secret generic unrelated --from-literal=x=y
+$KL get secret unrelated                        # forbidden: no relationship found between node ... and this object
+$KL label node $(hostname | tr A-Z a-z) node-role.kubernetes.io/worker=   # NodeRestriction: not allowed to modify labels
+kubectl get clusterrolebinding system:node -o yaml                          # no subjects
+```
+
+## 3g. port-forward, attach, cp (Phase 6f)
+
+```bash
+kubectl run web --image=nginx:1.27-alpine && kubectl wait --for=condition=Ready pod/web
+kubectl port-forward pod/web 8080:80 &      # Forwarding from 127.0.0.1:8080 -> 80
+curl -s localhost:8080 | head -4
+KUBECTL_PORT_FORWARD_WEBSOCKETS=false kubectl port-forward pod/web 8081:80 &   # plain SPDY
+kubectl run -it --rm shell --image=busybox:1.36 -- sh                           # attach with a TTY
+kubectl cp /etc/hostname web:/tmp/hostname && kubectl exec web -- cat /tmp/hostname
+KUBECTL_REMOTE_COMMAND_WEBSOCKETS=false kubectl exec -it web -- sh              # exec over SPDY
+```
+
+## 3h. Resource metrics (Phase 6g)
+
+`hack/local-up-cluster.sh` deploys metrics-server with CoreDNS (needs kube-proxy). Give it ~30 s for two scrapes:
+
+```bash
+kubectl get apiservices                       # v1beta1.metrics.k8s.io   kube-system/metrics-server   True
+kubectl top nodes
+kubectl top pods -A
+kubectl get --raw /apis/metrics.k8s.io/v1beta1/nodes | head -c 300
+P=_output/local/pki
+curl -s --cacert $P/ca.crt --cert $P/apiserver-kubelet-client.crt --key $P/apiserver-kubelet-client.key \
+  https://$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Gateway}}'):10250/metrics/resource | head
+```
+
+## 3i. Persistent volumes (Phase 6h)
+
+`hack/local-up-cluster.sh` enables the host-path provisioner and the `standard (default)` class:
+
+```bash
+kubectl get sc                                   # standard (default)   kubernetes.io/host-path   Delete   Immediate
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: {name: data}
+spec: {accessModes: [ReadWriteOnce], resources: {requests: {storage: 100Mi}}}
+---
+apiVersion: v1
+kind: Pod
+metadata: {name: writer}
+spec:
+  containers: [{name: app, image: busybox:1.36, command: [sh, -c, "date > /data/now; sleep 3600"], volumeMounts: [{name: d, mountPath: /data}]}]
+  volumes: [{name: d, persistentVolumeClaim: {claimName: data}}]
+EOF
+kubectl get pvc,pv                               # Bound, pvc-<uid>, RWO, standard
+kubectl delete pvc data --wait=false; kubectl get pvc data   # Terminating while the pod uses it
+kubectl delete pod writer                        # then the claim and (Delete policy) the volume go
+```
+
+On console clusters the default class is `local-path` (WaitForFirstConsumer): the claim binds when its pod is
+scheduled, to a directory on that pod's node.
+
+## 3j. Certificates (Phase 6i)
+
+```bash
+# A client certificate for "jane" through the CSR API
+openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout jane.key -subj "/O=dev/CN=jane" -out jane.csr
+kubectl apply -f - <<YAML
+apiVersion: certificates.k8s.io/v1
+kind: CertificateSigningRequest
+metadata: {name: jane}
+spec: {request: $(base64 -w0 < jane.csr), signerName: kubernetes.io/kube-apiserver-client, usages: [client auth], expirationSeconds: 86400}
+YAML
+kubectl get csr                       # jane  ...  kubernetes.io/kube-apiserver-client  kubernetes-admin  24h  Pending
+kubectl certificate approve jane      # → Approved,Issued
+kubectl get csr jane -o jsonpath='{.status.certificate}' | base64 -d > jane.crt
+
+# Bootstrap tokens and joining a node
+kubeadm token create --print-join-command --kubeconfig _output/local-up-cluster/admin.conf
+kubeadm token list --kubeconfig _output/local-up-cluster/admin.conf
+kubeadm join HOST:PORT --token TOKEN --discovery-token-ca-cert-hash sha256:HASH --kubeconfig-dir /tmp/node2
+kubelet --bootstrap-kubeconfig /tmp/node2/bootstrap-kubelet.conf --kubeconfig /tmp/node2/kubelet.conf --rotate-certificates ...
+
+# Certificate lifetimes
+kubeadm certs check-expiration --cert-dir _output/local-up-cluster/pki --kubeconfig-dir _output/local-up-cluster
+kubeadm certs renew all --cert-dir ... --kubeconfig-dir ...   # then restart the control plane
+```
+
+## 3k. CustomResourceDefinitions (Phase 6j)
+
+```bash
+kubectl apply -f examples/crontab-crd.yaml
+kubectl wait --for condition=established crd/crontabs.stable.example.com
+kubectl get crd                                   # NAME  CREATED AT
+kubectl api-resources --api-group=stable.example.com
+kubectl apply -f examples/crontab.yaml
+kubectl get ct                                    # SPEC  REPLICAS  AGE columns; replicas defaulted to 1
+kubectl get ct my-new-cron-object -o yaml
+kubectl patch ct my-new-cron-object --type=merge -p '{"spec":{"replicas":50}}'
+# → spec.replicas: Invalid value: 50: spec.replicas in body should be less than or equal to 10
+kubectl apply -f - <<'YAML'                       # → strict decoding error: unknown field "spec.foo"
+apiVersion: stable.example.com/v1
+kind: CronTab
+metadata: {name: x}
+spec: {foo: 1}
+YAML
+kubectl scale ct my-new-cron-object --replicas=3
+kubectl patch ct my-new-cron-object --subresource=status --type=merge -p '{"status":{"replicas":3}}'
+kubectl get --raw /apis/stable.example.com/v1/namespaces/default/crontabs/my-new-cron-object/scale
+kubectl explain crontab.spec
+kubectl get apiservices | grep example            # v1.stable.example.com  Local
+kubectl delete crd crontabs.stable.example.com    # deletes the instances first
+```
+
 ## 4. Workloads
 
 ```bash
@@ -344,7 +501,6 @@ Stop the cluster (Ctrl-C) and start it again without `CLEAN=1`: `kubectl get all
 
 | Missing | Arrives in |
 |---------|------------|
-| etcd storage | Phase 6c |
+| `kubectl explain` for built-in types, audit | next |
 | containerd runtime, `kubectl explain`, metrics, audit | Phase 6d |
-| `kubectl attach/port-forward/cp`, multi-host pod networking (CNI) | later |
 | TLS, users, RBAC, `kubectl explain` schemas | Phase 6 |

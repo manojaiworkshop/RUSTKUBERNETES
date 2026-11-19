@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     let hub = Arc::new(events::Hub::default());
     let app = Arc::new(App {
         jobs: jobs::Jobs::new(hub.clone(), data.join("jobs")),
-        bundle: bundle::Bundle { binaries, dir: data.join("bundle") },
+        bundle: bundle::Bundle { binaries, dir: data.join("bundle"), build_lock: Default::default() },
         ssh: transport::SshPaths { dir: data.join("ssh") },
         store,
         sessions: auth::Sessions::default(),

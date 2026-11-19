@@ -142,16 +142,44 @@ pub fn parse_time(s: &str) -> Option<chrono::DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&Utc))
 }
 
-/// Human readable age like `kubectl get` prints it (`5s`, `3m`, `2h`, `4d`).
+/// Human readable age like `kubectl get` prints it (`translateTimestampSince`).
 pub fn human_age(timestamp: &str) -> String {
     let Some(t) = parse_time(timestamp) else { return "<unknown>".into() };
-    let secs = (Utc::now() - t).num_seconds().max(0);
-    match secs {
-        s if s < 120 => format!("{s}s"),
-        s if s < 60 * 60 => format!("{}m", s / 60),
-        s if s < 48 * 3600 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86400),
+    human_duration((Utc::now() - t).num_seconds())
+}
+
+/// `duration.HumanDuration` (`k8s.io/apimachinery/pkg/util/duration`), in seconds.
+pub fn human_duration(seconds: i64) -> String {
+    if seconds < -1 {
+        return "<invalid>".into();
+    } else if seconds < 0 {
+        return "0s".into();
+    } else if seconds < 60 * 2 {
+        return format!("{seconds}s");
     }
+    let minutes = seconds / 60;
+    if minutes < 10 {
+        let s = seconds % 60;
+        return if s == 0 { format!("{minutes}m") } else { format!("{minutes}m{s}s") };
+    } else if minutes < 60 * 3 {
+        return format!("{minutes}m");
+    }
+    let hours = seconds / 3600;
+    if hours < 8 {
+        let m = minutes % 60;
+        return if m == 0 { format!("{hours}h") } else { format!("{hours}h{m}m") };
+    } else if hours < 48 {
+        return format!("{hours}h");
+    } else if hours < 24 * 8 {
+        let h = hours % 24;
+        return if h == 0 { format!("{}d", hours / 24) } else { format!("{}d{h}h", hours / 24) };
+    } else if hours < 24 * 365 * 2 {
+        return format!("{}d", hours / 24);
+    } else if hours < 24 * 365 * 8 {
+        let dy = (hours / 24) % 365;
+        return if dy == 0 { format!("{}y", hours / 24 / 365) } else { format!("{}y{dy}d", hours / 24 / 365) };
+    }
+    format!("{}y", hours / 24 / 365)
 }
 
 /// Generates a fresh UID.

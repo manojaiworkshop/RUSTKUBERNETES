@@ -70,6 +70,10 @@ pub fn api_resource_list(registry: &Registry, group: &str, version: &str) -> Opt
                 "binding" => ("Binding", "", "", vec!["create"]),
                 "eviction" => ("Eviction", "policy", "v1", vec!["create"]),
                 "token" => ("TokenRequest", "authentication.k8s.io", "v1", vec!["create"]),
+                "exec" => ("PodExecOptions", "", "", vec!["create", "get"]),
+                "attach" => ("PodAttachOptions", "", "", vec!["create", "get"]),
+                "portforward" => ("PodPortForwardOptions", "", "", vec!["create", "get"]),
+                "log" => ("Pod", "", "", vec!["get"]),
                 _ => (&r.kind, "", "", vec!["get"]),
             };
             let mut e = json!({

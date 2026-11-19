@@ -98,6 +98,7 @@ case "$CMD" in
   remove)
     for s in $(reverse); do stop_one "$s"; done
     ids=$(pod_containers); [ -n "$ids" ] && docker rm -f $ids >/dev/null 2>&1 && echo "removed $(echo "$ids" | wc -l) pod container(s)"
+    [ -f "$CDIR/services/teardown.sh" ] && sh "$CDIR/services/teardown.sh"
     if [ "$SUP" != nohup ]; then rm -f "$(unitdir)"/rustkube-"$CLUSTER"-*.service; sctl daemon-reload || true; fi
     rm -rf "$CDIR"
     echo "removed cluster $CLUSTER"

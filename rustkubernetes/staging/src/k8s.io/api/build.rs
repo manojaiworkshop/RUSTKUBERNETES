@@ -17,6 +17,10 @@ fn main() {
         "k8s.io/api/rbac/v1/generated.proto",
         "k8s.io/api/authorization/v1/generated.proto",
         "k8s.io/api/authentication/v1/generated.proto",
+        "k8s.io/api/storage/v1/generated.proto",
+        "k8s.io/api/certificates/v1/generated.proto",
+        "k8s.io/api/networking/v1/generated.proto",
+        "k8s.io/api/autoscaling/v2/generated.proto",
         "k8s.io/apimachinery/pkg/apis/meta/v1/generated.proto",
         "k8s.io/apimachinery/pkg/runtime/generated.proto",
     ];

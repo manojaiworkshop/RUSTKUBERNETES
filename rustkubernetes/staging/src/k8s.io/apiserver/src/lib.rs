@@ -15,9 +15,11 @@
 //! | [`openapi`]   | `kube-openapi`: `/openapi/v3` documents          |
 //! | [`discovery`] | `endpoints/discovery`: `/api`, `/apis`, resource lists |
 //! | [`proxy`]     | `pods/log` streaming + `pods/exec` WebSocket proxy to the kubelet |
+//! | [`warning`]   | `pkg/warning`: `Warning` response headers |
 //! | [`server`]    | `pkg/server`: `GenericAPIServer`, routing, health    |
 
 pub mod admission;
+pub mod aggregator;
 pub mod authentication;
 pub mod authorization;
 pub mod discovery;
@@ -31,6 +33,7 @@ pub mod request;
 pub mod server;
 pub mod storage;
 pub mod table;
+pub mod warning;
 
 pub use registry::{Registry, ResourceInfo, Strategy, StrategyContext};
 pub use server::{ApiServer, ApiServerConfig};

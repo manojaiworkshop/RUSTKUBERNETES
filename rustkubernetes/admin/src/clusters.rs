@@ -33,7 +33,7 @@ use k8s_client_go::{Api, Client, ListParams};
 use serde_json::{json, Value};
 
 use crate::auth::{KUBE_GROUP, KUBE_USER_PREFIX};
-use crate::bundle::KUBE_PROXY_IMAGE;
+use crate::bundle::{ETCD_IMAGE, KUBE_PROXY_IMAGE};
 use crate::jobs::JobHandle;
 use crate::state::{dns_label, Cluster, Machine};
 use crate::transport::sh_quote;
@@ -41,6 +41,18 @@ use crate::App;
 
 pub const COREDNS_YAML: &str = include_str!("../../cluster/addons/dns/coredns/coredns.yaml");
 pub const CLUSTER_DNS: &str = "10.96.0.10";
+/// The Service range (kube-apiserver's default `--service-cluster-ip-range`).
+pub const SERVICE_CIDR: &str = "10.96.0.0/12";
+pub const FLANNEL_YAML: &str = include_str!("../../cluster/addons/flannel/kube-flannel.yaml");
+pub const METRICS_SERVER_YAML: &str = include_str!("../../cluster/addons/metrics-server/metrics-server.yaml");
+pub const LOCAL_PATH_STORAGE_YAML: &str = include_str!("../../cluster/addons/local-path-storage/local-path-storage.yaml");
+/// The kubenet bridge (and its Docker network) on every node.
+const KUBENET_BRIDGE: &str = "cbr0";
+
+/// The flannel add-on for a cluster's pod CIDR and backend.
+pub fn flannel_manifest(n: &crate::state::PodNetwork) -> String {
+    FLANNEL_YAML.replace("10.244.0.0/16", &n.pod_cidr).replace("\"Type\": \"vxlan\"", &format!("\"Type\": \"{}\"", n.backend))
+}
 const MANAGED_LABEL: &str = "rustkubeadmin.io/managed";
 
 /// A running cluster's connection and live watches.
@@ -443,6 +455,8 @@ fn payload(app: &App, c: &Cluster, plan: &NodePlan, master: &Machine) -> Result<
     if plan.master {
         for f in [
             "ca.crt",
+            // The controller manager signs CSRs with the cluster CA (--cluster-signing-*).
+            "ca.key",
             "apiserver.crt",
             "apiserver.key",
             "apiserver-kubelet-client.crt",
@@ -451,9 +465,38 @@ fn payload(app: &App, c: &Cluster, plan: &NodePlan, master: &Machine) -> Result<
             "sa.pub",
             "kubelet.crt",
             "kubelet.key",
+            "apiserver-etcd-client.crt",
+            "apiserver-etcd-client.key",
+            "front-proxy-ca.crt",
+            "front-proxy-client.crt",
+            "front-proxy-client.key",
+            "etcd/ca.crt",
+            "etcd/server.crt",
+            "etcd/server.key",
+            "etcd/peer.crt",
+            "etcd/peer.key",
+            "etcd/healthcheck-client.crt",
+            "etcd/healthcheck-client.key",
         ] {
+            if let Some(parent) = dir.join("pki").join(f).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::copy(src.join("pki").join(f), dir.join("pki").join(f)).with_context(|| format!("copying {f}"))?;
         }
+        // etcd, with the flags kubeadm writes into its static pod manifest.
+        let ename = format!("rustkube-etcd-{}", c.name);
+        let node = &plan.node;
+        let (ec, ep, em) = (p.etcd_client, p.etcd_peer, p.etcd_metrics);
+        service(
+            &dir,
+            &cd,
+            "etcd",
+            &format!(
+                "mkdir -p {cd}/etcd && chmod 700 {cd}/etcd\ndocker rm -f {ename} >/dev/null 2>&1 || true\nexec docker run --rm --name {ename} --network host --user \"$(id -u):$(id -g)\" \\\n  -v {cd}/etcd:/var/lib/etcd -v {cd}/pki/etcd:/etc/kubernetes/pki/etcd:ro {ETCD_IMAGE} etcd \\\n  --name={node} --data-dir=/var/lib/etcd --advertise-client-urls=https://{addr}:{ec} \\\n  --listen-client-urls=https://127.0.0.1:{ec},https://{addr}:{ec} --initial-advertise-peer-urls=https://{addr}:{ep} \\\n  --listen-peer-urls=https://{addr}:{ep} --initial-cluster={node}=https://{addr}:{ep} --listen-metrics-urls=http://127.0.0.1:{em} \\\n  --cert-file=/etc/kubernetes/pki/etcd/server.crt --key-file=/etc/kubernetes/pki/etcd/server.key --client-cert-auth=true \\\n  --trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt --peer-cert-file=/etc/kubernetes/pki/etcd/peer.crt \\\n  --peer-key-file=/etc/kubernetes/pki/etcd/peer.key --peer-client-cert-auth=true --peer-trusted-ca-file=/etc/kubernetes/pki/etcd/ca.crt \\\n  --experimental-initial-corrupt-check=true --experimental-watch-progress-notify-interval=5s --snapshot-count=10000"
+            ),
+        )?;
+        write(&dir.join("services/etcd.stop.sh"), &format!("#!/bin/sh\ndocker rm -f {ename} >/dev/null 2>&1 || true\n"))?;
+        order.push("etcd");
         for f in ["controller-manager.conf", "scheduler.conf", "kubelet.conf", "kube-proxy.conf"] {
             std::fs::copy(src.join(f), dir.join(f))?;
         }
@@ -462,15 +505,26 @@ fn payload(app: &App, c: &Cluster, plan: &NodePlan, master: &Machine) -> Result<
             &cd,
             "kube-apiserver",
             &format!(
-                "exec {bin}/kube-apiserver --bind-address {addr} --advertise-address {addr} --port {} --data-dir {cd}/data \\\n  --tls-cert-file {cd}/pki/apiserver.crt --tls-private-key-file {cd}/pki/apiserver.key --client-ca-file {cd}/pki/ca.crt \\\n  --authorization-mode Node,RBAC --service-account-key-file {cd}/pki/sa.pub --service-account-signing-key-file {cd}/pki/sa.key \\\n  --kubelet-client-certificate {cd}/pki/apiserver-kubelet-client.crt --kubelet-client-key {cd}/pki/apiserver-kubelet-client.key \\\n  --kubelet-certificate-authority {cd}/pki/ca.crt",
-                p.api
+                "exec {bin}/kube-apiserver --bind-address {addr} --advertise-address {addr} --port {} \\\n  --etcd-servers https://127.0.0.1:{} --etcd-cafile {cd}/pki/etcd/ca.crt --etcd-certfile {cd}/pki/apiserver-etcd-client.crt --etcd-keyfile {cd}/pki/apiserver-etcd-client.key \\\n  --tls-cert-file {cd}/pki/apiserver.crt --tls-private-key-file {cd}/pki/apiserver.key --client-ca-file {cd}/pki/ca.crt \\\n  --authorization-mode Node,RBAC --enable-admission-plugins NodeRestriction --service-account-key-file {cd}/pki/sa.pub --service-account-signing-key-file {cd}/pki/sa.key \\\n  --kubelet-client-certificate {cd}/pki/apiserver-kubelet-client.crt --kubelet-client-key {cd}/pki/apiserver-kubelet-client.key \\\n  --kubelet-certificate-authority {cd}/pki/ca.crt \\\n  --requestheader-client-ca-file {cd}/pki/front-proxy-ca.crt --requestheader-allowed-names front-proxy-client \\\n  --requestheader-username-headers X-Remote-User --requestheader-group-headers X-Remote-Group --requestheader-extra-headers-prefix X-Remote-Extra- \\\n  --proxy-client-cert-file {cd}/pki/front-proxy-client.crt --proxy-client-key-file {cd}/pki/front-proxy-client.key \\\n  --enable-bootstrap-token-auth",
+                p.api, p.etcd_client
             ),
         )?;
         service(
             &dir,
             &cd,
             "kube-controller-manager",
-            &format!("exec {bin}/kube-controller-manager --kubeconfig {cd}/controller-manager.conf --root-ca-file {cd}/pki/ca.crt --bind-address 127.0.0.1 --port {}", p.controller_manager),
+            &format!(
+                "exec {bin}/kube-controller-manager --kubeconfig {cd}/controller-manager.conf --root-ca-file {cd}/pki/ca.crt --bind-address 127.0.0.1 --port {} \\\n  --cluster-signing-cert-file {cd}/pki/ca.crt --cluster-signing-key-file {cd}/pki/ca.key --controllers '*,bootstrapsigner,tokencleaner'{}",
+                p.controller_manager,
+                if c.network.kubenet() {
+                    format!(
+                        " \\\n  --allocate-node-cidrs=true --cluster-cidr {} --service-cluster-ip-range {SERVICE_CIDR} --node-cidr-mask-size 24",
+                        c.network.pod_cidr
+                    )
+                } else {
+                    String::new()
+                }
+            ),
         )?;
         service(
             &dir,
@@ -487,18 +541,37 @@ fn payload(app: &App, c: &Cluster, plan: &NodePlan, master: &Machine) -> Result<
         std::fs::copy(creds.join("kubelet.conf"), dir.join("kubelet.conf"))?;
         std::fs::copy(src.join("kube-proxy.conf"), dir.join("kube-proxy.conf"))?;
     }
-    let dns = if c.dns { format!(" --cluster-dns {CLUSTER_DNS}") } else { String::new() };
+    let mut dns = if c.dns { format!(" --cluster-dns {CLUSTER_DNS}") } else { String::new() };
+    if c.network.kubenet() {
+        dns.push_str(&format!(" \\\n  --network-plugin kubenet --kubenet-bridge-name {KUBENET_BRIDGE}"));
+        if c.network.backend == "vxlan" {
+            dns.push_str(" --network-plugin-mtu 1450");
+        }
+        // `rustkube-node remove`: the bridge network and flannel's device and lease file (like `kubeadm reset`,
+        // iptables rules are left alone).
+        write(
+            &dir.join("services/teardown.sh"),
+            &format!(
+                "#!/bin/sh\ndocker network rm {KUBENET_BRIDGE} >/dev/null 2>&1 || true\ndocker run --rm --network host --cap-add NET_ADMIN -v /run:/host-run --entrypoint sh {KUBE_PROXY_IMAGE} -c 'ip link del flannel.1 2>/dev/null; rm -f /host-run/flannel/subnet.env' >/dev/null 2>&1 || true\n"
+            ),
+        )?;
+    }
     service(
         &dir,
         &cd,
         "kubelet",
         &format!(
-            "exec {bin}/kubelet --kubeconfig {cd}/kubelet.conf --hostname-override {} --node-ip {addr} --port {} --root-dir {cd}/kubelet \\\n  --tls-cert-file {cd}/pki/kubelet.crt --tls-private-key-file {cd}/pki/kubelet.key --client-ca-file {cd}/pki/ca.crt --authorization-mode Webhook{dns}",
+            "exec {bin}/kubelet --kubeconfig {cd}/kubelet.conf --hostname-override {} --node-ip {addr} --port {} --root-dir {cd}/kubelet \\\n  --tls-cert-file {cd}/pki/kubelet.crt --tls-private-key-file {cd}/pki/kubelet.key --client-ca-file {cd}/pki/ca.crt --authorization-mode Webhook \\\n  --rotate-certificates --cert-dir {cd}/kubelet-pki{dns}",
             plan.node, p.kubelet
         ),
     )?;
     order.push("kubelet");
     if c.kube_proxy {
+        let (cidr, hairpin) = if c.network.kubenet() {
+            (format!("CIDR={}", c.network.pod_cidr), KUBENET_BRIDGE)
+        } else {
+            ("CIDR=$(docker network inspect bridge -f '{{(index .IPAM.Config 0).Subnet}}')".to_string(), "docker0")
+        };
         let cname = format!("rustkube-proxy-{}-{}", c.name, plan.node);
         let table = format!("rustkube-{}-{}", c.name, plan.node);
         service(
@@ -506,7 +579,7 @@ fn payload(app: &App, c: &Cluster, plan: &NodePlan, master: &Machine) -> Result<
             &cd,
             "kube-proxy",
             &format!(
-                "docker rm -f {cname} >/dev/null 2>&1 || true\nCIDR=$(docker network inspect bridge -f '{{{{(index .IPAM.Config 0).Subnet}}}}')\nexec docker run --rm --name {cname} --network host --cap-add NET_ADMIN --cap-add NET_RAW \\\n  -v {bin}/kube-proxy:/usr/local/bin/kube-proxy:ro -v {cd}/kube-proxy.conf:/etc/kubernetes/kubeconfig:ro {KUBE_PROXY_IMAGE} \\\n  --kubeconfig /etc/kubernetes/kubeconfig --hostname-override {} --cluster-cidr \"$CIDR\" --nft-table {table} --hairpin-bridge docker0 \\\n  --healthz-bind-address 127.0.0.1:{} --metrics-bind-address 127.0.0.1:{}",
+                "docker rm -f {cname} >/dev/null 2>&1 || true\n{cidr}\nexec docker run --rm --name {cname} --network host --cap-add NET_ADMIN --cap-add NET_RAW \\\n  -v {bin}/kube-proxy:/usr/local/bin/kube-proxy:ro -v {cd}/kube-proxy.conf:/etc/kubernetes/kubeconfig:ro {KUBE_PROXY_IMAGE} \\\n  --kubeconfig /etc/kubernetes/kubeconfig --hostname-override {} --cluster-cidr \"$CIDR\" --nft-table {table} --hairpin-bridge {hairpin} \\\n  --healthz-bind-address 127.0.0.1:{} --metrics-bind-address 127.0.0.1:{}",
                 plan.node, p.proxy_healthz, p.proxy_metrics
             ),
         )?;
@@ -633,6 +706,15 @@ pub async fn provision(app: Arc<App>, name: String, job: JobHandle) -> Result<()
     wait_for(&job, Duration::from_secs(60), || async { client.get_text("/readyz").await.map(|t| t.contains("ok")).unwrap_or(false) })
         .await
         .context("the API server did not become ready (see kube-apiserver.log on the master)")?;
+    // kubeadm's RBAC for TLS bootstrapping and client certificate rotation
+    // (kubelets renew their certificates through CSRs the controller manager approves and signs).
+    job.log("configuring bootstrap tokens and kubelet certificate rotation (kubeadm init phase bootstrap-token)");
+    run_local(
+        &job,
+        &kubeadm,
+        &["init".into(), "phase".into(), "bootstrap-token".into(), "--kubeconfig".into(), dir.join("admin.conf").display().to_string()],
+    )
+    .await?;
     for p in plans.iter().skip(1) {
         let d = payload(&app, &c, p, &master)?;
         deploy(&app, &c, p, &d, &job).await?;
@@ -654,9 +736,29 @@ pub async fn provision(app: Arc<App>, name: String, job: JobHandle) -> Result<()
     })
     .await
     .context("nodes did not become Ready (see kubelet.log on the machines)")?;
+    if c.network.kubenet() {
+        job.log(format!("deploying the flannel pod network add-on ({}, {})", c.network.backend, c.network.pod_cidr));
+        apply_yaml(&client, &flannel_manifest(&c.network), "default").await?;
+    }
     if c.dns {
         job.log("deploying the CoreDNS add-on");
         apply_yaml(&client, COREDNS_YAML, "default").await?;
+    }
+    if c.metrics {
+        job.log("deploying the metrics-server add-on (kubectl top)");
+        apply_yaml(&client, METRICS_SERVER_YAML, "default").await?;
+    }
+    if c.storage {
+        job.log("deploying the local-path-provisioner add-on (default StorageClass local-path)");
+        apply_yaml(&client, LOCAL_PATH_STORAGE_YAML, "default").await?;
+        // Make it the default class, as kind does.
+        let sc: Api<k8s_api::storage::v1::StorageClass> = Api::all(client.clone());
+        sc.patch(
+            "local-path",
+            k8s_client_go::PatchType::Merge,
+            &serde_json::json!({"metadata": {"annotations": {"storageclass.kubernetes.io/is-default-class": "true"}}}),
+        )
+        .await?;
     }
     app.store.update_cluster(&name, |x| {
         x.status = "running".into();

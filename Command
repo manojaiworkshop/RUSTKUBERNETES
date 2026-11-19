@@ -32,6 +32,42 @@ system:kube-controller-manager has full access, because the controller manager r
 Next is 6c: swapping our in-memory store for real etcd behind the existing storage interface. After that, 6d: containerd, kubectl explain, metrics and audit.
 -----------------------------------------------------------------------------------
 
+Phases 1–6b and the web console are done. Here's what's left, grouped and in the order I'd do it. A few limitations listed in the Phase 4 and 5 docs (unauthenticated kubelet API, no ServiceAccount tokens, no cluster DNS) were already fixed in Phase 6, so I've left them out; I'll correct those docs.
+
+1. Storage: etcd (6c, next on the roadmap)
+Real etcd behind the existing storage interface. Today the state is one in-memory store saved to a JSON file, which means one API server, no high availability, and a full rewrite on every save.
+Run etcd in a container from local-up and from the console's cluster creation, connected with TLS client certificates.
+Encryption at rest for Secrets.
+2. Pod networking: the biggest functional gap
+No network between machines. Each machine's pods sit on its own Docker bridge, so pods on different machines can't talk, and Services only reach endpoints on the same machine. Every machine also hands out the same 172.17.x addresses.
+Fix: give each node its own pod range and add routes between nodes (like flannel's simple mode), or add a basic CNI.
+3. Missing kubectl features
+kubectl port-forward, kubectl attach, kubectl cp.
+kubectl top: no metrics from the kubelet or a metrics API yet.
+kubectl explain and client-side validation: needs real OpenAPI schemas.
+4. Security hardening (6d)
+Node authorizer and NodeRestriction: today any kubelet's credentials can read every Secret in the cluster.
+Certificate rotation, the certificate-request (CSR) API and kubelet TLS bootstrap: certificates are issued once and last 1 year.
+Audit logging in the API server, and /metrics.
+Smaller items: OIDC login, webhook token authentication, API Priority & Fairness.
+5. Runtime and node features
+A containerd runtime alongside Docker.
+Persistent volumes: PVs and PVCs with a local or hostPath provisioner.
+Node housekeeping: eviction under memory or disk pressure, image garbage collection, static pods.
+Probes: HTTPS probes, and real gRPC probes (today gRPC probes always report healthy).
+6. Missing APIs and controllers
+HorizontalPodAutoscaler (needs #3's metrics), PodDisruptionBudget, Ingress and NetworkPolicy, ResourceQuota and LimitRange, StorageClass.
+7. Smaller items
+kube-proxy: only rewrites changed rules instead of reloading everything (today session affinity resets on every change), plus an iptables mode.
+HTTPS for the web console.
+My recommendation
+6c etcd (moderate): it's the foundation for any production use.
+Pod networking (moderate): makes multi-machine clusters actually work, which the console's master/worker setup needs.
+Node authorizer + NodeRestriction (small): closes the biggest remaining security hole.
+Then port-forward, cp, attach, metrics and top, then persistent volumes.
+Should I start with 6c, etcd, or would you rather go for pod networking first, so multi-machine clusters from the console are fully usable?
+
+-------------------------------------------------------------------------------
 
 
 hack/local-up-cluster.sh            # the first run builds the kube-proxy image (~40s)
@@ -45,3 +81,6 @@ cd ~/Documents/KUBERNETES/rustkubernetes
 make admin
 export RUSTKUBEADMIN_USER=admin RUSTKUBEADMIN_PASSWORD='manoj123'
 make run-admin              # http://127.0.0.1:8090
+
+
+

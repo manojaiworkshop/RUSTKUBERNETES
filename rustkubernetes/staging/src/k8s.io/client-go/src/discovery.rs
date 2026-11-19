@@ -35,7 +35,15 @@ pub async fn server_preferred_resources(client: &Client) -> Result<Vec<ServerRes
     let mut out = vec![];
     for (group, version) in gvs {
         let path = if group.is_empty() { format!("/api/{version}") } else { format!("/apis/{group}/{version}") };
-        let list = client.get_json(&path).await?;
+        // As `ServerPreferredResources` (`ErrGroupDiscoveryFailed`): a group/version that
+        // fails (e.g. an unavailable aggregated API) is skipped, the rest is returned.
+        let list = match client.get_json(&path).await {
+            Ok(l) => l,
+            Err(e) => {
+                tracing::debug!("discovery: unable to retrieve the complete list of server APIs: {group}/{version}: {e}");
+                continue;
+            }
+        };
         for r in list["resources"].as_array().into_iter().flatten() {
             let name = r["name"].as_str().unwrap_or("");
             if name.contains('/') {

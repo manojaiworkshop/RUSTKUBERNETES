@@ -10,12 +10,22 @@ k8s-api.workspace = true
 k8s-apimachinery.workspace = true
 k8s-client-go.workspace = true
 kube-apis.workspace = true
+k8s-component-helpers.workspace = true
+uuid.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 futures.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+base64.workspace = true
+reqwest.workspace = true
+ring = "0.17"
+yasna = "0.5"
+x509-parser.workspace = true
+
+[dev-dependencies]
+rcgen = { workspace = true, features = ["x509-parser"] }
 
 [lints]
 workspace = true

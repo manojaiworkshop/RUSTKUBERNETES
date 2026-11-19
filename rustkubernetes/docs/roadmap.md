@@ -110,15 +110,61 @@ See [phase-6-security.md](phase-6-security.md).
 `admin/` — see [admin-console.md](admin-console.md): users, console permissions and RBAC grants (impersonation),
 machines with the offline installer (local or SSH), cluster provisioning and lifecycle, and live cluster views.
 
-### 6c — etcd backend ⏳ next
+### 6c — etcd backend ✅ done
 
-- etcd v3 gRPC client behind the existing `Storage` trait (revisions → resourceVersion, watch, compaction → 410).
-- etcd run as a container by `hack/local-up-cluster.sh`; `--etcd-servers` with TLS client certificates.
-- Encryption at rest (`--encryption-provider-config`).
+See [phase-6c-etcd.md](phase-6c-etcd.md): etcd v3 over gRPC (vendored client generated from etcd's protos), upstream
+etcd3 store semantics and key layout, compactor, `etcd` health checks, kubeadm's etcd PKI and flags, encryption at
+rest (aesgcm/identity), etcd in local-up, the node e2e suite and console-created clusters.
 
-### 6d — More hardening
+### 6d — Pod network ✅ done
 
-- containerd CRI runtime backend (gRPC), next to the Docker one.
-- OpenAPI v3 schemas for `kubectl explain` and client-side validation.
-- `/metrics`, audit logging, API Priority and Fairness, the Node authorizer + NodeRestriction, certificate
-  rotation and the CSR API.
+See [phase-6d-pod-network.md](phase-6d-pod-network.md): the node IPAM controller (RangeAllocator, cidrset),
+pod CIDR validation, kubelet NetworkReady and `updatePodCIDR`, kubenet in the dockershim (bridge `cbr0`), the
+flannel add-on (vxlan / host-gw, `--ip-masq`), `NetworkUnavailable` taints, and a two-machine e2e suite. rustkubeadmin
+clusters use it by default.
+
+### 6e — Node authorization ✅ done
+
+See [phase-6e-node-authorization.md](phase-6e-node-authorization.md): the Node authorizer (object graph,
+`NodeRules`, own Node/Lease/pods only), the NodeRestriction admission plugin, `--enable-admission-plugins` /
+`--disable-admission-plugins`, kubelet `--node-labels` validation, upstream-style RBAC bootstrap reconciliation.
+
+### 6f — Streaming ✅ done
+
+See [phase-6f-streaming.md](phase-6f-streaming.md): SPDY/3.1 (`spdystream`), kubelet port forwarding into the
+pod's network namespace, the API server's WebSocket→SPDY tunnel and SPDY proxy, attach (WebSocket and SPDY),
+exec over SPDY, upstream exec/attach parameters, `kubectl cp`.
+
+### 6g — Resource metrics ✅ done
+
+See [phase-6g-metrics.md](phase-6g-metrics.md): kubelet `/metrics/resource`, HTTPS probes, the aggregation layer
+(`kube-aggregator`: APIService, autoregistration, availability, discovery, front-proxy proxy), front-proxy PKI and
+flags, `extension-apiserver-authentication`, metrics-server v0.8.0 add-on, `kubectl top`.
+
+### 6h — Persistent volumes ✅ done
+
+See [phase-6h-storage.md](phase-6h-storage.md): PV/PVC/StorageClass with upstream validation and printers, the
+storage admission plugins, the PV binder (binding, in-tree host-path and external provisioning, reclaim),
+protection and ephemeral-volume controllers, scheduler `VolumeBinding`, kubelet PVC mounts, local-path-provisioner
+add-on, and a protobuf decoding fix for inlined Go structs.
+
+### 6i — Certificates ✅ done
+
+See [phase-6i-certificates.md](phase-6i-certificates.md): the CSR API and its admission plugins, the signing,
+approving and cleaner controllers, bootstrap tokens, kubelet TLS bootstrapping and certificate rotation,
+`kubeadm token|join|certs check-expiration|certs renew`.
+
+### 6j — CustomResourceDefinitions ✅ done
+
+See [phase-6j-crds.md](phase-6j-crds.md): `apiextensions.k8s.io/v1` CRDs with upstream validation, naming and
+establishing, structural schemas (validation, defaulting, pruning, list types), `fieldValidation` and `Warning`
+headers, `status`/`scale` subresources, printer columns, multiple versions with `None`/`Webhook` conversion,
+deprecation warnings, OpenAPI v3 for `kubectl explain`, the cleanup finalizer, local APIServices, and garbage
+collection of custom resources.
+
+### Next ⏳ (towards a minimal production cluster)
+
+1. 6k — Ingress, NetworkPolicy, ResourceQuota, LimitRange, PodDisruptionBudget, HorizontalPodAutoscaler.
+2. 6l — HA control plane (several API servers, multi-member etcd, backup/restore).
+3. 6m — audit logging, API Priority and Fairness, control-plane `/metrics`.
+4. 6n — containerd CRI runtime; conformance run; OpenAPI v3 schemas for built-in types (`kubectl explain`).

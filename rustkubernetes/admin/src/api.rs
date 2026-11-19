@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use crate::auth::{self, Principal, COOKIE};
 use crate::clusters;
 use crate::machines;
-use crate::state::{dns_label, now, Cluster, Grant, Machine, Ports, User, PERMISSIONS};
+use crate::state::{dns_label, now, Cluster, Grant, Machine, PodNetwork, Ports, User, PERMISSIONS};
 use crate::transport::SshPaths;
 use crate::App;
 
@@ -645,6 +645,33 @@ struct ClusterReq {
     dns: bool,
     #[serde(default = "yes")]
     kube_proxy: bool,
+    #[serde(default = "yes")]
+    metrics: bool,
+    #[serde(default = "yes")]
+    storage: bool,
+    #[serde(default)]
+    network: Option<PodNetwork>,
+}
+
+/// Checks the pod network of a new cluster.
+fn valid_network(n: &PodNetwork) -> Result<(), ApiErr> {
+    match n.plugin.as_str() {
+        "" => return Ok(()),
+        "kubenet" => {}
+        other => return Err(bad(format!("unknown network plugin {other:?} (want kubenet or empty)"))),
+    }
+    if n.backend != "vxlan" && n.backend != "host-gw" {
+        return Err(bad("the flannel backend must be vxlan or host-gw"));
+    }
+    let cidr: k8s_apimachinery::net::IpNet = n.pod_cidr.parse().map_err(|_| bad(format!("invalid pod CIDR {:?}", n.pod_cidr)))?;
+    if !cidr.is_ipv4() || cidr.prefix > 22 {
+        return Err(bad("the pod CIDR must be an IPv4 network of /22 or larger (each node gets a /24)"));
+    }
+    let services: k8s_apimachinery::net::IpNet = clusters::SERVICE_CIDR.parse().unwrap();
+    if cidr.overlaps(&services) {
+        return Err(bad(format!("the pod CIDR {cidr} overlaps the Service range {services}")));
+    }
+    Ok(())
 }
 
 fn valid_cluster_name(app: &App, n: &str) -> Result<(), ApiErr> {
@@ -691,6 +718,17 @@ async fn clusters_create(State(app): S, h: HeaderMap, Json(r): Json<ClusterReq>)
         return Err(bad(format!("the master's address must be an IP address (machine {} has {:?})", master.name, master.address)));
     }
     let ports = r.ports.unwrap_or_default();
+    let network = r.network.unwrap_or_else(PodNetwork::recommended);
+    valid_network(&network)?;
+    for id in &ids {
+        if let Some(m) = app.store.machine(id) {
+            if let (Ok(ip), Ok(cidr)) = (m.address.parse::<std::net::IpAddr>(), network.pod_cidr.parse::<k8s_apimachinery::net::IpNet>()) {
+                if network.kubenet() && cidr.contains(ip) {
+                    return Err(bad(format!("the pod CIDR {cidr} contains the address of machine {}", m.name)));
+                }
+            }
+        }
+    }
     app.store.write(|d| {
         d.clusters.push(Cluster {
             name: name.clone(),
@@ -702,6 +740,11 @@ async fn clusters_create(State(app): S, h: HeaderMap, Json(r): Json<ClusterReq>)
             ports,
             dns: r.dns,
             kube_proxy: r.kube_proxy,
+            // metrics-server reaches the API through the `kubernetes` Service.
+            metrics: r.metrics && r.kube_proxy,
+            // The provisioner reaches the API through the `kubernetes` Service.
+            storage: r.storage && r.kube_proxy,
+            network,
             created_at: now(),
             created_by: p.username.clone(),
             ..Default::default()

@@ -23,7 +23,10 @@ export interface Machine {
   cluster: string | null; role: "master" | "worker" | null;
 }
 
-export interface Ports { api: number; kubelet: number; controller_manager: number; scheduler: number; proxy_healthz: number; proxy_metrics: number }
+/** Pod network of a cluster: plugin "kubenet" (pod CIDR per node, flannel add-on) or "" (each machine's Docker bridge). */
+export interface PodNetwork { plugin: string; podCidr: string; backend: string }
+
+export interface Ports { api: number; kubelet: number; controller_manager: number; scheduler: number; proxy_healthz: number; proxy_metrics: number; etcd_client: number; etcd_peer: number; etcd_metrics: number }
 
 export interface ClusterSummary {
   name: string; kind: "managed" | "imported"; status: "provisioning" | "running" | "stopped" | "failed" | "deleting";

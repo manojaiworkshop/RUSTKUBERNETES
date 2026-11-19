@@ -155,8 +155,8 @@ fn verb_on(user: &UserInfo, verb: &str, resource: &str, ns: &str, name: &str) ->
 
 async fn referenced_rules(ctx: &StrategyContext<'_>, ns: &str, r: &RoleRef) -> Result<Vec<PolicyRule>, ApiError> {
     let key = match r.kind.as_str() {
-        "Role" => format!("/registry/roles.{GROUP}/{ns}/{}", r.name),
-        _ => format!("/registry/clusterroles.{GROUP}/{}", r.name),
+        "Role" => format!("/registry/roles/{ns}/{}", r.name),
+        _ => format!("/registry/clusterroles/{}", r.name),
     };
     match ctx.storage.get(&key).await {
         Ok(obj) => Ok(rules_of(&obj)),

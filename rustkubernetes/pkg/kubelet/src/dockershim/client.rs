@@ -30,6 +30,30 @@ impl DockerClient {
         Self { socket: PathBuf::from(endpoint.trim_start_matches("unix://")) }
     }
 
+    /// Request with a raw body (e.g. `PUT /containers/{id}/archive` with a tar stream).
+    pub async fn call_raw(&self, method: Method, path: &str, content_type: &str, body: Bytes) -> Result<()> {
+        let stream =
+            UnixStream::connect(&self.socket).await.with_context(|| format!("connecting to docker at {}", self.socket.display()))?;
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(conn);
+        let req = Request::builder()
+            .method(method)
+            .uri(format!("http://docker{API}{path}"))
+            .header("Host", "docker")
+            .header("Content-Type", content_type)
+            .body(Full::new(body))?;
+        let (status, bytes) = Self::read_body(sender.send_request(req).await?).await?;
+        if !status.is_success() {
+            let msg = serde_json::from_slice::<Value>(&bytes).ok().and_then(|v| v["message"].as_str().map(String::from));
+            return Err(DockerError {
+                status: status.as_u16(),
+                message: msg.unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned()),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     async fn send(&self, method: Method, path: &str, body: Option<&Value>, upgrade: bool) -> Result<Response<Incoming>> {
         let stream =
             UnixStream::connect(&self.socket).await.with_context(|| format!("connecting to docker at {}", self.socket.display()))?;

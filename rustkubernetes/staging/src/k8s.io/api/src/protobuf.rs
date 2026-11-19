@@ -169,9 +169,37 @@ fn fixup(v: &mut Value, desc: &MessageDescriptor) {
             fixup_value(fv, &md);
         }
     }
+    // Embedded Go structs (`json:",inline"`) are separate messages in protobuf; their
+    // fields belong to the parent object in JSON.
+    for (msg, field) in INLINE_FIELDS {
+        if desc.full_name() == *msg {
+            if let Some(Value::Object(inner)) = obj.remove(*field) {
+                for (k, v) in inner {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+        }
+    }
     // Drop nulls left by special conversions (zero Time, invalid RawExtension).
     obj.retain(|_, v| !v.is_null());
 }
+
+/// Message fields that are embedded structs in the Go types (tagged `json:""`, so
+/// inlined in JSON). Generated from the upstream `types.go` files.
+const INLINE_FIELDS: &[(&str, &str)] = &[
+    ("k8s.io.api.core.v1.Volume", "volumeSource"),
+    ("k8s.io.api.core.v1.PersistentVolumeSpec", "persistentVolumeSource"),
+    ("k8s.io.api.core.v1.SecretProjection", "localObjectReference"),
+    ("k8s.io.api.core.v1.ConfigMapVolumeSource", "localObjectReference"),
+    ("k8s.io.api.core.v1.ConfigMapProjection", "localObjectReference"),
+    ("k8s.io.api.core.v1.ConfigMapKeySelector", "localObjectReference"),
+    ("k8s.io.api.core.v1.SecretKeySelector", "localObjectReference"),
+    ("k8s.io.api.core.v1.ConfigMapEnvSource", "localObjectReference"),
+    ("k8s.io.api.core.v1.SecretEnvSource", "localObjectReference"),
+    ("k8s.io.api.core.v1.Probe", "handler"),
+    ("k8s.io.api.networking.v1.IngressRule", "ingressRuleValue"),
+    ("k8s.io.api.core.v1.EphemeralContainer", "ephemeralContainerCommon"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -195,6 +223,41 @@ mod tests {
         let mut out = MAGIC.to_vec();
         out.extend(unknown.encode_to_vec());
         out
+    }
+
+    #[test]
+    fn inlines_embedded_structs() {
+        let msg = |name: &str| DynamicMessage::new(pool().get_message_by_name(name).unwrap());
+        let body = encode("v1", "Pod", |m| {
+            let mut hp = msg("k8s.io.api.core.v1.HostPathVolumeSource");
+            hp.set_field_by_name("path", PValue::String("/opt/data".into()));
+            let mut src = msg("k8s.io.api.core.v1.VolumeSource");
+            src.set_field_by_name("hostPath", PValue::Message(hp));
+            let mut vol = msg("k8s.io.api.core.v1.Volume");
+            vol.set_field_by_name("name", PValue::String("data".into()));
+            vol.set_field_by_name("volumeSource", PValue::Message(src));
+            let mut spec = msg("k8s.io.api.core.v1.PodSpec");
+            spec.set_field_by_name("volumes", PValue::List(vec![PValue::Message(vol)]));
+            m.set_field_by_name("spec", PValue::Message(spec));
+        });
+        let v = decode(&body).unwrap();
+        assert_eq!(v["spec"]["volumes"][0], serde_json::json!({"name": "data", "hostPath": {"path": "/opt/data"}}));
+        // ConfigMapVolumeSource embeds LocalObjectReference.
+        let body = encode("v1", "Pod", |m| {
+            let mut r = msg("k8s.io.api.core.v1.LocalObjectReference");
+            r.set_field_by_name("name", PValue::String("cfg".into()));
+            let mut cm = msg("k8s.io.api.core.v1.ConfigMapVolumeSource");
+            cm.set_field_by_name("localObjectReference", PValue::Message(r));
+            let mut src = msg("k8s.io.api.core.v1.VolumeSource");
+            src.set_field_by_name("configMap", PValue::Message(cm));
+            let mut vol = msg("k8s.io.api.core.v1.Volume");
+            vol.set_field_by_name("name", PValue::String("c".into()));
+            vol.set_field_by_name("volumeSource", PValue::Message(src));
+            let mut spec = msg("k8s.io.api.core.v1.PodSpec");
+            spec.set_field_by_name("volumes", PValue::List(vec![PValue::Message(vol)]));
+            m.set_field_by_name("spec", PValue::Message(spec));
+        });
+        assert_eq!(decode(&body).unwrap()["spec"]["volumes"][0]["configMap"]["name"], "cfg");
     }
 
     #[test]

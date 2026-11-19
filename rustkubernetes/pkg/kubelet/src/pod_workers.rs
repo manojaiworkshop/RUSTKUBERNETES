@@ -156,8 +156,17 @@ impl PodWorker {
 
     async fn sync_running(&mut self, pod: &Pod) -> anyhow::Result<()> {
         let spec = pod.spec.clone().unwrap_or_default();
+        // If the network plugin is not ready, only start the pod if it uses the host network.
+        if let Some(e) = self.ctx.runtime_state.network_error().filter(|_| !spec.host_network.unwrap_or(false)) {
+            let msg = format!("network is not ready: {e}");
+            self.event(pod, None, WARNING, "NetworkNotReady", msg.clone());
+            for c in spec.containers.iter().chain(spec.init_containers.iter().flatten()) {
+                self.extra(&c.name).waiting = Some(("ContainerCreating".into(), String::new()));
+            }
+            anyhow::bail!(msg);
+        }
         // Volumes.
-        let vols = match volumes::setup(&self.ctx.client, &self.ctx.root, pod).await {
+        let vols = match volumes::setup(&self.ctx.client, self.ctx.runtime.as_ref(), &self.ctx.root, pod).await {
             Ok(v) => {
                 // Clear markers left by an earlier (transient) mount failure.
                 for e in self.extras.values_mut() {

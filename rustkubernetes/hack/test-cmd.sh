@@ -11,7 +11,8 @@
 # The API server keeps state in memory; logs and the kubeconfig are written to
 # _output/test-cmd/ (overwritten on every run, removed by `make clean`).
 #
-# Usage: hack/test-cmd.sh
+# Usage: hack/test-cmd.sh                 # in-memory storage
+#        STORAGE=etcd hack/test-cmd.sh    # a throwaway etcd (registry.k8s.io/etcd) as storage
 
 set -o errexit -o nounset -o pipefail
 
@@ -23,14 +24,26 @@ cargo build -q -p kube-apiserver -p kube-controller-manager -p kube-scheduler -p
 WORK=${ROOT}/_output/test-cmd
 mkdir -p "${WORK}"
 PORT=${PORT:-$((20000 + RANDOM % 20000))}
-"${ROOT}/target/debug/kube-apiserver" --port "${PORT}" --bind-address 127.0.0.1 > "${WORK}/apiserver.log" 2>&1 &
+STORAGE_FLAGS=()
+ETCD_CONTAINER=
+if [[ "${STORAGE:-memory}" == "etcd" ]]; then
+  ETCD_PORT=$((PORT + 10))
+  ETCD_CONTAINER=rk-etcd-test-cmd-${PORT}
+  docker run -d --rm --name "${ETCD_CONTAINER}" --network host registry.k8s.io/etcd:3.5.21-0 etcd --name test \
+    --data-dir /var/lib/etcd --listen-client-urls "http://127.0.0.1:${ETCD_PORT}" --advertise-client-urls "http://127.0.0.1:${ETCD_PORT}" \
+    --listen-peer-urls "http://127.0.0.1:$((ETCD_PORT + 1))" --initial-advertise-peer-urls "http://127.0.0.1:$((ETCD_PORT + 1))" \
+    --initial-cluster "test=http://127.0.0.1:$((ETCD_PORT + 1))" >/dev/null
+  STORAGE_FLAGS=(--etcd-servers "http://127.0.0.1:${ETCD_PORT}")
+  echo "+++ storage: etcd on 127.0.0.1:${ETCD_PORT}"
+fi
+"${ROOT}/target/debug/kube-apiserver" --port "${PORT}" --bind-address 127.0.0.1 "${STORAGE_FLAGS[@]}" > "${WORK}/apiserver.log" 2>&1 &
 APISERVER_PID=$!
 KCM_PID=
 SCHED_PID=
 KUBEMARK_PID=
-trap 'kill ${APISERVER_PID} ${KCM_PID} ${SCHED_PID} ${KUBEMARK_PID} 2>/dev/null || true' EXIT
+trap 'kill ${APISERVER_PID} ${KCM_PID} ${SCHED_PID} ${KUBEMARK_PID} 2>/dev/null || true; [[ -n "${ETCD_CONTAINER}" ]] && docker rm -f "${ETCD_CONTAINER}" >/dev/null 2>&1; true' EXIT
 
-for _ in $(seq 1 100); do
+for _ in $(seq 1 200); do
   curl -sf "http://127.0.0.1:${PORT}/readyz" >/dev/null 2>&1 && break
   sleep 0.1
 done
@@ -121,6 +134,23 @@ if command -v kubectl >/dev/null 2>&1; then
   run "priorityclass"         "system-node-critical"      ${K} get priorityclasses
   run "cascading delete"      "No resources found"        bash -c "${K} delete deploy redis-leader -n guestbook >/dev/null; sleep 3; ${K} get rs,pods -n guestbook -l app=redis"
   run "namespace terminates"  "NotFound"                  bash -c "${K} delete ns guestbook --wait=false >/dev/null; sleep 4; ${K} get ns guestbook"
+  echo "+++ CustomResourceDefinitions (apiextensions-apiserver)"
+  run "create crd"            "crontabs.stable.example.com created" ${K} apply -f examples/crontab-crd.yaml
+  run "crd established"       "condition met"             ${K} wait --for condition=established --timeout=10s crd/crontabs.stable.example.com
+  run "crd table"             "CREATED AT"                ${K} get crd
+  run "api-resources"         "crontabs   ct"             ${K} api-resources --api-group=stable.example.com
+  run "create custom resource" "crontab.stable.example.com/my-new-cron-object created" ${K} apply -f examples/crontab.yaml
+  run "printer columns"       "* * * * */5   1"           ${K} get ct
+  run "schema defaulting"     "replicas: 1"               ${K} get crontab my-new-cron-object -o yaml
+  run "strict field validation" 'unknown field "spec.foo"' bash -c "${K} create -f - <<<'{\"apiVersion\":\"stable.example.com/v1\",\"kind\":\"CronTab\",\"metadata\":{\"name\":\"x\"},\"spec\":{\"foo\":1}}'"
+  run "schema validation"     "spec.replicas in body should be less than or equal to 10" ${K} patch ct my-new-cron-object --type=merge -p '{"spec":{"replicas":11}}'
+  run "scale subresource"     "scaled"                    ${K} scale ct my-new-cron-object --replicas=3
+  run "status subresource"    "patched"                   ${K} patch ct my-new-cron-object --subresource=status --type=merge -p '{"status":{"replicas":3}}'
+  run "no strategic merge"    "application/strategic-merge-patch+json is not supported" ${K} patch ct my-new-cron-object -p '{"spec":{"image":"x"}}'
+  run "explain"               "cronSpec"                  ${K} explain crontab.spec
+  run "delete crd"            "deleted"                   ${K} delete crd crontabs.stable.example.com --timeout=30s
+  # Depending on kubectl's discovery cache: a 404 from the server, or an unknown type.
+  run "resource gone"         "gone"                      bash -c "${K} get crontabs.stable.example.com 2>&1 | grep -qE 'could not find the requested resource|doesn.t have a resource type' && echo gone"
 else
   echo "+++ official kubectl not installed; skipping"
 fi

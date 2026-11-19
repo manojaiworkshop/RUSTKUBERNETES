@@ -12,12 +12,14 @@ use serde::{Deserialize, Serialize};
 
 pub mod apps;
 pub mod batch;
+pub mod certificates;
 pub mod coordination;
 pub mod core;
 pub mod discovery;
 pub mod protobuf;
 pub mod rbac;
 pub mod scheduling;
+pub mod storage;
 
 /// Static type information for a top-level API object.
 pub trait Resource: Serialize + DeserializeOwned + Clone + Send + Sync + std::fmt::Debug + 'static {

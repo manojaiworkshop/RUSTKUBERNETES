@@ -5,9 +5,11 @@
 //!   (bridge network, or the host network for `hostNetwork` pods);
 //! * app containers use `NetworkMode/IpcMode = container:<sandbox>` so all
 //!   containers of a pod share localhost and the pod IP;
-//! * names follow dockershim: `k8s_<container>_<pod>_<namespace>_<uid>_<attempt>`.
+//! * names follow dockershim: `k8s_<container>_<pod>_<namespace>_<uid>_<attempt>`;
+//! * the pod network comes from a [`network`] plugin (`--network-plugin`).
 
 pub mod client;
+pub mod network;
 
 use std::collections::BTreeMap;
 
@@ -25,6 +27,11 @@ pub struct DockerRuntime {
     client: DockerClient,
     node: String,
     pause_image: String,
+    network: network::Plugin,
+    /// Per-sandbox files written by the shim (resolv.conf).
+    state_dir: std::path::PathBuf,
+    /// Static `rustkube-portforward` helper (see [`Runtime::port_forward`]).
+    portforward_helper: Option<std::path::PathBuf>,
 }
 
 fn enc(s: &str) -> String {
@@ -49,6 +56,47 @@ fn time(v: &Value) -> Option<String> {
     })
 }
 
+/// Docker stats → [`ContainerStats`]. cgroup v2 reports `inactive_file`, v1 `total_inactive_file`.
+pub fn parse_stats(v: &Value) -> ContainerStats {
+    let usage = v["memory_stats"]["usage"].as_u64().unwrap_or(0);
+    let st = &v["memory_stats"]["stats"];
+    let inactive = st["inactive_file"].as_u64().or(st["total_inactive_file"].as_u64()).unwrap_or(0);
+    let ts = v["read"]
+        .as_str()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .filter(|t| t.timestamp() > 0)
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_else(|| chrono::Utc::now().timestamp_millis());
+    ContainerStats {
+        timestamp_ms: ts,
+        cpu_usage_ns: v["cpu_stats"]["cpu_usage"]["total_usage"].as_u64().unwrap_or(0),
+        memory_working_set_bytes: usage.saturating_sub(inactive),
+    }
+}
+
+/// A ustar archive with one empty file (mode 0644) or directory (0755).
+fn tar_entry(name: &str, dir: bool) -> Vec<u8> {
+    let mut h = [0u8; 512];
+    let n = name.as_bytes();
+    h[..n.len().min(100)].copy_from_slice(&n[..n.len().min(100)]);
+    let field = |h: &mut [u8; 512], off: usize, len: usize, v: &str| h[off..off + v.len().min(len)].copy_from_slice(v.as_bytes());
+    field(&mut h, 100, 8, if dir { "0000755\0" } else { "0000644\0" });
+    field(&mut h, 108, 8, "0000000\0");
+    field(&mut h, 116, 8, "0000000\0");
+    field(&mut h, 124, 12, "00000000000\0");
+    let mtime = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    field(&mut h, 136, 12, &format!("{mtime:011o}\0"));
+    h[156] = if dir { b'5' } else { b'0' };
+    field(&mut h, 257, 6, "ustar\0");
+    field(&mut h, 263, 2, "00");
+    h[148..156].copy_from_slice(b"        ");
+    let sum: u32 = h.iter().map(|b| *b as u32).sum();
+    field(&mut h, 148, 8, &format!("{sum:06o}\0 "));
+    let mut out = h.to_vec();
+    out.extend_from_slice(&[0u8; 1024]);
+    out
+}
+
 /// `repo[:tag][@digest]` → (`fromImage`, `tag`) for `POST /images/create`.
 pub fn split_image(image: &str) -> (String, String) {
     if image.contains('@') {
@@ -63,7 +111,31 @@ pub fn split_image(image: &str) -> (String, String) {
 
 impl DockerRuntime {
     pub fn new(endpoint: &str, node: &str, pause_image: &str) -> Self {
-        Self { client: DockerClient::new(endpoint), node: node.into(), pause_image: pause_image.into() }
+        Self {
+            client: DockerClient::new(endpoint),
+            node: node.into(),
+            pause_image: pause_image.into(),
+            network: network::Plugin::Noop,
+            state_dir: std::env::temp_dir().join(format!("rustkube-dockershim-{node}")),
+            portforward_helper: None,
+        }
+    }
+
+    /// The static helper that connects to `localhost:PORT` inside a pod (`rustkube-portforward`).
+    pub fn with_portforward_helper(mut self, path: Option<std::path::PathBuf>) -> Self {
+        self.portforward_helper = path;
+        self
+    }
+
+    /// Uses a network plugin (`--network-plugin`) and keeps per-sandbox files under `state_dir`.
+    pub fn with_network(mut self, plugin: network::Plugin, state_dir: std::path::PathBuf) -> Self {
+        self.network = plugin;
+        self.state_dir = state_dir;
+        self
+    }
+
+    fn sandbox_dir(&self, id: &str) -> std::path::PathBuf {
+        self.state_dir.join("sandboxes").join(id)
     }
 
     async fn ensure_image(&self, image: &str) -> Result<()> {
@@ -106,7 +178,55 @@ impl Runtime for DockerRuntime {
         Ok(format!("docker://{}", v["Version"].as_str().unwrap_or("unknown")))
     }
 
+    async fn status(&self) -> Result<Vec<RuntimeCondition>> {
+        let runtime = match self.client.call(Method::GET, "/version", None).await {
+            Ok(_) => RuntimeCondition::ok(RUNTIME_READY),
+            Err(e) => RuntimeCondition::failed(RUNTIME_READY, "DockerDaemonNotReady", format!("docker: failed to get docker version: {e}")),
+        };
+        let network = match self.network.status() {
+            Ok(()) => RuntimeCondition::ok(NETWORK_READY),
+            Err(e) => RuntimeCondition::failed(NETWORK_READY, "NetworkPluginNotReady", format!("docker: network plugin is not ready: {e}")),
+        };
+        Ok(vec![runtime, network])
+    }
+
+    /// The Docker daemon creates the path: a stopped helper container with the
+    /// parent directory bind-mounted receives a one-entry tar archive.
+    async fn ensure_host_path(&self, path: &std::path::Path, dir: bool) -> Result<()> {
+        let parent = path.parent().filter(|p| p.is_absolute()).ok_or_else(|| anyhow!("hostPath {} has no parent", path.display()))?;
+        let name = path.file_name().ok_or_else(|| anyhow!("hostPath {} has no file name", path.display()))?.to_string_lossy();
+        self.ensure_image(&self.pause_image).await?;
+        let body = json!({
+            "Image": self.pause_image,
+            "Labels": {labels::NODE: self.node},
+            "HostConfig": {"Binds": [format!("{}:/host", parent.display())], "NetworkMode": "none"},
+        });
+        let r = self.client.call(Method::POST, "/containers/create", Some(&body)).await?;
+        let id = r["Id"].as_str().ok_or_else(|| anyhow!("no helper container id"))?.to_string();
+        let res = self
+            .client
+            .call_raw(Method::PUT, &format!("/containers/{id}/archive?path=/host"), "application/x-tar", tar_entry(&name, dir).into())
+            .await;
+        let _ = self.client.call(Method::DELETE, &format!("/containers/{id}?force=1"), None).await;
+        res?;
+        tracing::info!(path = %path.display(), dir, "created hostPath through the container runtime");
+        Ok(())
+    }
+
+    async fn update_runtime_config(&self, pod_cidr: &str) -> Result<()> {
+        if pod_cidr.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(pod_cidr, "Docker cri received runtime config");
+        self.network.pod_cidr_changed(&self.client, pod_cidr).await
+    }
+
     async fn run_pod_sandbox(&self, cfg: &SandboxConfig) -> Result<String> {
+        if !cfg.host_network {
+            if let Err(e) = self.network.status() {
+                return Err(anyhow!("docker: network plugin is not ready: {e}"));
+            }
+        }
         self.ensure_image(&self.pause_image).await?;
         let mut lbl = cfg.labels.clone();
         lbl.insert(labels::POD_UID.into(), cfg.pod_uid.clone());
@@ -129,7 +249,7 @@ impl Runtime for DockerRuntime {
             "Labels": lbl,
             "ExposedPorts": exposed,
             "HostConfig": {
-                "NetworkMode": if cfg.host_network { "host" } else { "bridge" },
+                "NetworkMode": if cfg.host_network { "host" } else { self.network.network_mode() },
                 "IpcMode": "shareable",
                 "PortBindings": bindings,
                 "RestartPolicy": {"Name": "no"},
@@ -144,6 +264,13 @@ impl Runtime for DockerRuntime {
         let name = format!("k8s_POD_{}_{}_{}_{}", cfg.name, cfg.namespace, cfg.pod_uid, cfg.attempt);
         let r = self.client.call(Method::POST, &format!("/containers/create?name={}", enc(&name)), Some(&body)).await?;
         let id = r["Id"].as_str().ok_or_else(|| anyhow!("no sandbox id"))?.to_string();
+        // On a user-defined Docker network the runtime's resolv.conf points at Docker's embedded
+        // DNS; write the pod's own file and mount it into every container instead (like CRI runtimes).
+        if let (false, Some(d), network::Plugin::Kubenet(_)) = (cfg.host_network, &cfg.dns, &self.network) {
+            let dir = self.sandbox_dir(&id);
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("resolv.conf"), network::resolv_conf(&d.servers, &d.searches, &d.options))?;
+        }
         self.client.call(Method::POST, &format!("/containers/{id}/start"), None).await?;
         Ok(id)
     }
@@ -158,7 +285,9 @@ impl Runtime for DockerRuntime {
     }
 
     async fn remove_pod_sandbox(&self, id: &str) -> Result<()> {
-        self.remove_container(id).await
+        self.remove_container(id).await?;
+        let _ = std::fs::remove_dir_all(self.sandbox_dir(id));
+        Ok(())
     }
 
     async fn list_pod_sandboxes(&self) -> Result<Vec<SandboxStatus>> {
@@ -166,8 +295,11 @@ impl Runtime for DockerRuntime {
         for id in self.list_ids(labels::TYPE_SANDBOX).await? {
             let Ok(c) = self.inspect(&id).await else { continue };
             let lbl = str_map(&c["Config"]["Labels"]);
-            let ip = c["NetworkSettings"]["Networks"]["bridge"]["IPAddress"]
+            let nets = &c["NetworkSettings"]["Networks"];
+            let ip = nets[self.network.network_mode()]["IPAddress"]
                 .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| nets.as_object()?.values().filter_map(|n| n["IPAddress"].as_str()).find(|s| !s.is_empty()))
                 .or(c["NetworkSettings"]["IPAddress"].as_str())
                 .filter(|s| !s.is_empty())
                 .map(String::from);
@@ -201,10 +333,16 @@ impl Runtime for DockerRuntime {
             (Some(u), None) => json!(u.to_string()),
             _ => Value::Null,
         };
+        let mut binds: Vec<String> =
+            cfg.mounts.iter().map(|m| format!("{}:{}{}", m.host_path, m.container_path, if m.read_only { ":ro" } else { "" })).collect();
+        let resolv = self.sandbox_dir(&sandbox.id).join("resolv.conf");
+        if resolv.exists() && !cfg.mounts.iter().any(|m| m.container_path == "/etc/resolv.conf") {
+            binds.push(format!("{}:/etc/resolv.conf", resolv.display()));
+        }
         let mut host = json!({
             "NetworkMode": format!("container:{}", sandbox.id),
             "IpcMode": format!("container:{}", sandbox.id),
-            "Binds": cfg.mounts.iter().map(|m| format!("{}:{}{}", m.host_path, m.container_path, if m.read_only { ":ro" } else { "" })).collect::<Vec<_>>(),
+            "Binds": binds,
             "RestartPolicy": {"Name": "no"},
             "Privileged": cfg.privileged,
             "ReadonlyRootfs": cfg.read_only_rootfs,
@@ -377,6 +515,97 @@ impl Runtime for DockerRuntime {
         Ok(ExecSession { exec_id, io: Box::new(io), tty })
     }
 
+    async fn attach(&self, id: &str, stdin: bool, tty: bool) -> Result<ExecSession> {
+        let path = format!("/containers/{id}/attach?stream=1&stdin={}&stdout=1&stderr=1", stdin as u8);
+        let io = self.client.hijack(&path, &json!({})).await?;
+        Ok(ExecSession { exec_id: id.to_string(), io: Box::new(io), tty })
+    }
+
+    /// `GET /containers/{id}/stats?stream=false&one-shot=true`: the cgroup counters
+    /// (cAdvisor's working set = usage - inactive_file).
+    async fn container_stats(&self, id: &str) -> Result<ContainerStats> {
+        let v = self.client.call(Method::GET, &format!("/containers/{id}/stats?stream=false&one-shot=true"), None).await?;
+        Ok(parse_stats(&v))
+    }
+
+    async fn resize_container(&self, id: &str, width: u16, height: u16) -> Result<()> {
+        self.client.call(Method::POST, &format!("/containers/{id}/resize?h={height}&w={width}"), None).await.map(|_| ())
+    }
+
+    /// cri-dockerd runs `nsenter -t <pid> -n socat - TCP4:localhost:PORT` as root. The
+    /// kubelet here is unprivileged, so the same copy runs in a short-lived container
+    /// that joins the sandbox's network namespace: the pause image (no libc) with the
+    /// static `rustkube-portforward` helper mounted as its entrypoint, attached to
+    /// the stream through its stdin/stdout.
+    async fn port_forward(&self, sandbox_id: &str, port: u16, stream: tokio::io::DuplexStream) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let helper = self
+            .portforward_helper
+            .as_ref()
+            .ok_or_else(|| anyhow!("port forwarding is unavailable: the rustkube-portforward helper was not found next to the kubelet"))?;
+        self.ensure_image(&self.pause_image).await?;
+        let body = json!({
+            "Image": self.pause_image,
+            "Entrypoint": ["/rustkube-portforward"],
+            "Cmd": [port.to_string()],
+            "OpenStdin": true,
+            "StdinOnce": true,
+            "AttachStdin": true,
+            "AttachStdout": true,
+            "AttachStderr": true,
+            "Labels": {labels::NODE: self.node, "io.rustkubernetes.portforward": sandbox_id},
+            "HostConfig": {
+                "NetworkMode": format!("container:{sandbox_id}"),
+                "Binds": [format!("{}:/rustkube-portforward:ro", helper.display())],
+                "RestartPolicy": {"Name": "no"},
+            },
+        });
+        let r = self.client.call(Method::POST, "/containers/create", Some(&body)).await?;
+        let id = r["Id"].as_str().ok_or_else(|| anyhow!("no port-forward container id"))?.to_string();
+        let result = async {
+            let io = self.client.hijack(&format!("/containers/{id}/attach?stream=1&stdin=1&stdout=1&stderr=1"), &json!({})).await?;
+            self.client.call(Method::POST, &format!("/containers/{id}/start"), None).await?;
+            let (mut c_rd, mut c_wr) = tokio::io::split(io);
+            let (mut s_rd, mut s_wr) = tokio::io::split(stream);
+            // Client → pod; at EOF close the helper's stdin (it half-closes the socket).
+            let input = tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut s_rd, &mut c_wr).await;
+                let _ = c_wr.shutdown().await;
+            });
+            // Pod → client (stdout); stderr carries the helper's error message.
+            let mut demux = Demuxer::default();
+            let mut stderr = Vec::new();
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                match c_rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        for (st, data) in demux.push(&buf[..n]) {
+                            if st == 2 {
+                                stderr.extend_from_slice(&data);
+                            } else if s_wr.write_all(&data).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = s_wr.shutdown().await;
+            input.abort();
+            let w = self.client.call(Method::POST, &format!("/containers/{id}/wait"), None).await?;
+            match w["StatusCode"].as_i64().unwrap_or(0) {
+                0 => Ok(()),
+                code => {
+                    let msg = String::from_utf8_lossy(&stderr).trim().to_string();
+                    Err(anyhow!("exit status {code}: {msg}"))
+                }
+            }
+        }
+        .await;
+        let _ = self.client.call(Method::DELETE, &format!("/containers/{id}?force=1"), None).await;
+        result
+    }
+
     async fn exec_resize(&self, exec_id: &str, width: u16, height: u16) -> Result<()> {
         self.client.call(Method::POST, &format!("/exec/{exec_id}/resize?h={height}&w={width}"), None).await.map(|_| ())
     }
@@ -422,5 +651,33 @@ mod tests {
         assert_eq!(split_image("localhost:5000/app:v1"), ("localhost:5000/app".into(), "v1".into()));
         assert_eq!(split_image("registry.k8s.io/pause:3.10"), ("registry.k8s.io/pause".into(), "3.10".into()));
         assert_eq!(split_image("x@sha256:ab"), ("x@sha256:ab".into(), "".into()));
+    }
+}
+
+#[cfg(test)]
+mod docker_tests {
+    use super::*;
+
+    /// Needs Docker: `DOCKER_TESTS=1 cargo test -p kube-kubelet host_path_through_docker`.
+    #[tokio::test]
+    async fn host_path_through_docker() {
+        if std::env::var("DOCKER_TESTS").is_err() {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!("rk-hostpath-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let rt = DockerRuntime::new("unix:///var/run/docker.sock", "test-node", "registry.k8s.io/pause:3.10");
+        rt.ensure_host_path(&base.join("xtables.lock"), false).await.unwrap();
+        rt.ensure_host_path(&base.join("flannel"), true).await.unwrap();
+        assert!(base.join("xtables.lock").is_file());
+        assert!(base.join("flannel").is_dir());
+        let _ = tokio::process::Command::new("docker")
+            .args(["run", "--rm", "-v", &format!("{}:/x", base.display()), "busybox:1.36", "rm", "-rf", "/x/xtables.lock", "/x/flannel"])
+            .status()
+            .await;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

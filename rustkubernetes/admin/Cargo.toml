@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 k8s-api.workspace = true
+k8s-apimachinery.workspace = true
 k8s-client-go.workspace = true
 anyhow.workspace = true
 axum.workspace = true

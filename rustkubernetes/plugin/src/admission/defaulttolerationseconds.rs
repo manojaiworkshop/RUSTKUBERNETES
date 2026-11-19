@@ -33,7 +33,11 @@ impl AdmissionPlugin for DefaultTolerationSeconds {
     }
 
     async fn admit(&self, attrs: &Attributes<'_>, obj: &mut Value, _ctx: &StrategyContext<'_>) -> Result<(), ApiError> {
-        if attrs.operation != Operation::Create || !attrs.resource.group.is_empty() || attrs.resource.plural != "pods" {
+        if attrs.operation != Operation::Create
+            || attrs.subresource.is_some()
+            || !attrs.resource.group.is_empty()
+            || attrs.resource.plural != "pods"
+        {
             return Ok(());
         }
         let mut tols = obj.pointer("/spec/tolerations").and_then(Value::as_array).cloned().unwrap_or_default();

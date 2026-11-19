@@ -16,10 +16,13 @@ use k8s_apiserver::authentication::AuthenticatorChain;
 use k8s_apiserver::authorization::Authorizer;
 use k8s_apiserver::registry::{DefaultStrategy, ResourceBuilder};
 use k8s_apiserver::{ApiServer, ApiServerConfig, Registry, Storage};
+use kube_plugin::admission::certificates;
 use kube_plugin::admission::defaulttolerationseconds::DefaultTolerationSeconds;
 use kube_plugin::admission::namespace::lifecycle::NamespaceLifecycle;
+use kube_plugin::admission::noderestriction;
 use kube_plugin::admission::priority::Priority;
 use kube_plugin::admission::serviceaccount::ServiceAccount as ServiceAccountAdmission;
+use kube_plugin::admission::storage::{setdefault, storageobjectinuseprotection};
 use kube_plugin::auth::rbac::bootstrappolicy;
 use kube_registry::authentication::{AuthnReviewStrategy, Review as AuthnReview};
 use kube_registry::authorization::{Review, ReviewStrategy};
@@ -51,6 +54,10 @@ pub struct Config {
     pub service_accounts: Option<ServiceAccountConfig>,
     /// Static JSON documents served at fixed paths (OIDC discovery, JWKS).
     pub extra_paths: Vec<(String, Value)>,
+    /// `--enable-admission-plugins` (in addition to the default ones).
+    pub enable_admission_plugins: Vec<String>,
+    /// `--disable-admission-plugins`
+    pub disable_admission_plugins: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -73,6 +80,8 @@ impl Default for Config {
             authorizer: None,
             kubelet_tls: None,
             service_accounts: None,
+            enable_admission_plugins: vec![],
+            disable_admission_plugins: vec![],
             extra_paths: vec![],
         }
     }
@@ -95,7 +104,7 @@ pub fn build_registry(cfg: &Config) -> Result<Registry, String> {
         ResourceBuilder::new("", "v1", "Pod", "pods", true)
             .short_names(&["po"])
             .categories(&["all"])
-            .subresources(&["status", "binding", "log", "exec", "attach"])
+            .subresources(&["status", "binding", "log", "exec", "attach", "portforward"])
             .strategy(Arc::new(core::pod::PodStrategy { kubelet_https: cfg.kubelet_tls.is_some() }))
             .build(),
     );
@@ -200,6 +209,42 @@ pub fn build_registry(cfg: &Config) -> Result<Registry, String> {
 
     // scheduling.k8s.io/v1
     r.register(
+        ResourceBuilder::new("", "v1", "PersistentVolume", "persistentvolumes", false)
+            .short_names(&["pv"])
+            .subresources(&["status"])
+            .strategy(Arc::new(kube_registry::storage::persistent_volume()))
+            .build(),
+    );
+    r.register(
+        ResourceBuilder::new("", "v1", "PersistentVolumeClaim", "persistentvolumeclaims", true)
+            .short_names(&["pvc"])
+            .subresources(&["status"])
+            .strategy(Arc::new(kube_registry::storage::persistent_volume_claim()))
+            .build(),
+    );
+    r.register(
+        ResourceBuilder::new("storage.k8s.io", "v1", "StorageClass", "storageclasses", false)
+            .short_names(&["sc"])
+            .strategy(Arc::new(kube_registry::storage::storage_class()))
+            .build(),
+    );
+    // certificates.k8s.io/v1
+    r.register(
+        ResourceBuilder::new("certificates.k8s.io", "v1", "CertificateSigningRequest", "certificatesigningrequests", false)
+            .short_names(&["csr"])
+            .subresources(&["status", "approval"])
+            .strategy(Arc::new(kube_registry::certificates::CsrStrategy))
+            .build(),
+    );
+    r.register(
+        ResourceBuilder::new("apiregistration.k8s.io", "v1", "APIService", "apiservices", false)
+            .subresources(&["status"])
+            .strategy(Arc::new(kube_registry::apiregistration::apiservice()))
+            .build(),
+    );
+    // apiextensions.k8s.io (the apiextensions-apiserver delegate)
+    k8s_apiextensions_apiserver::install(&mut r);
+    r.register(
         ResourceBuilder::new("scheduling.k8s.io", "v1", "PriorityClass", "priorityclasses", false)
             .short_names(&["pc"])
             .strategy(Arc::new(batch::priorityclass()))
@@ -249,15 +294,70 @@ pub fn build_registry(cfg: &Config) -> Result<Registry, String> {
 }
 
 /// Builds the API server (does not start serving).
+/// Admission plugins this server knows, in upstream's fixed order (`AllOrderedPlugins`).
+pub const ALL_ORDERED_PLUGINS: &[&str] = &[
+    NAMESPACE_LIFECYCLE,
+    SERVICE_ACCOUNT,
+    noderestriction::PLUGIN_NAME,
+    PRIORITY,
+    DEFAULT_TOLERATION_SECONDS,
+    setdefault::PLUGIN_NAME,
+    storageobjectinuseprotection::PLUGIN_NAME,
+    certificates::APPROVAL_PLUGIN_NAME,
+    certificates::SIGNING_PLUGIN_NAME,
+    certificates::SUBJECT_RESTRICTION_PLUGIN_NAME,
+];
+const NAMESPACE_LIFECYCLE: &str = "NamespaceLifecycle";
+const SERVICE_ACCOUNT: &str = "ServiceAccount";
+const PRIORITY: &str = "Priority";
+const DEFAULT_TOLERATION_SECONDS: &str = "DefaultTolerationSeconds";
+/// Off unless enabled (`DefaultOffAdmissionPlugins`).
+pub const DEFAULT_OFF_PLUGINS: &[&str] = &[noderestriction::PLUGIN_NAME];
+
+/// `--enable-admission-plugins` / `--disable-admission-plugins` → enabled plugins, in order.
+pub fn enabled_admission_plugins(enable: &[String], disable: &[String]) -> Result<Vec<&'static str>, String> {
+    let mut errs = vec![];
+    for (flag, list) in [("enable-admission-plugins", enable), ("disable-admission-plugins", disable)] {
+        for p in list.iter().filter(|p| !p.is_empty()) {
+            if !ALL_ORDERED_PLUGINS.contains(&p.as_str()) {
+                errs.push(format!("{flag} plugin {p:?} is unknown"));
+            }
+        }
+    }
+    let overlap: Vec<&String> = enable.iter().filter(|p| !p.is_empty() && disable.contains(p)).collect();
+    if !overlap.is_empty() {
+        errs.push(format!("{overlap:?} in enable-admission-plugins and disable-admission-plugins overlapped"));
+    }
+    if !errs.is_empty() {
+        return Err(errs.join(", "));
+    }
+    Ok(ALL_ORDERED_PLUGINS
+        .iter()
+        .copied()
+        .filter(|p| (!DEFAULT_OFF_PLUGINS.contains(p) || enable.iter().any(|e| e == p)) && !disable.iter().any(|d| d == p))
+        .collect())
+}
+
+/// Builds the API server (does not start serving).
 pub fn new_server(cfg: &Config, storage: Arc<dyn Storage>) -> Result<Arc<ApiServer>, String> {
     let registry = build_registry(cfg)?;
-    let mut plugins: Vec<Arc<dyn k8s_apiserver::admission::AdmissionPlugin>> = vec![Arc::new(NamespaceLifecycle)];
-    // Pods only get API credentials when the server can issue tokens.
-    if cfg.service_accounts.is_some() {
-        plugins.push(Arc::new(ServiceAccountAdmission));
+    let mut plugins: Vec<Arc<dyn k8s_apiserver::admission::AdmissionPlugin>> = vec![];
+    for name in enabled_admission_plugins(&cfg.enable_admission_plugins, &cfg.disable_admission_plugins)? {
+        match name {
+            NAMESPACE_LIFECYCLE => plugins.push(Arc::new(NamespaceLifecycle)),
+            // Pods only get API credentials when the server can issue tokens.
+            SERVICE_ACCOUNT if cfg.service_accounts.is_some() => plugins.push(Arc::new(ServiceAccountAdmission)),
+            noderestriction::PLUGIN_NAME => plugins.push(Arc::new(noderestriction::NodeRestriction)),
+            PRIORITY => plugins.push(Arc::new(Priority)),
+            DEFAULT_TOLERATION_SECONDS => plugins.push(Arc::new(DefaultTolerationSeconds)),
+            setdefault::PLUGIN_NAME => plugins.push(Arc::new(setdefault::DefaultStorageClass)),
+            storageobjectinuseprotection::PLUGIN_NAME => plugins.push(Arc::new(storageobjectinuseprotection::StorageObjectInUseProtection)),
+            certificates::APPROVAL_PLUGIN_NAME => plugins.push(Arc::new(certificates::CertificateApproval)),
+            certificates::SIGNING_PLUGIN_NAME => plugins.push(Arc::new(certificates::CertificateSigning)),
+            certificates::SUBJECT_RESTRICTION_PLUGIN_NAME => plugins.push(Arc::new(certificates::CertificateSubjectRestriction)),
+            _ => {}
+        }
     }
-    plugins.push(Arc::new(Priority));
-    plugins.push(Arc::new(DefaultTolerationSeconds));
     Ok(ApiServer::new(ApiServerConfig {
         registry,
         storage,
@@ -322,48 +422,86 @@ async fn upsert(server: &Arc<ApiServer>, group: &str, plural: &str, ns: &str, ob
     }
 }
 
-/// `storage_rbac` post-start hook: creates missing bootstrap roles and bindings and
-/// updates those still marked `autoupdate: "true"`.
+/// `storage_rbac` post-start hook (`reconciliation.ReconcileClusterRole/Binding`
+/// with `RemoveExtraPermissions/RemoveExtraSubjects: false`): creates missing
+/// bootstrap roles and bindings; for those still marked `autoupdate: "true"` it
+/// adds missing rules and subjects (never removes any) and fixes a changed
+/// `roleRef` by recreating the binding.
 async fn reconcile_rbac(server: &Arc<ApiServer>) -> Result<(), ApiError> {
     let g = "rbac.authorization.k8s.io";
-    let wanted: Vec<(&str, Value, &[&str])> = bootstrappolicy::cluster_roles()
+    let wanted: Vec<(&str, Value)> = bootstrappolicy::cluster_roles()
         .into_iter()
-        .map(|r| ("clusterroles", serde_json::to_value(r).unwrap_or_default(), &["rules", "aggregationRule"][..]))
+        .map(|r| ("clusterroles", serde_json::to_value(r).unwrap_or_default()))
         .chain(
             bootstrappolicy::cluster_role_bindings()
                 .into_iter()
-                .map(|b| ("clusterrolebindings", serde_json::to_value(b).unwrap_or_default(), &["subjects", "roleRef"][..])),
+                .map(|b| ("clusterrolebindings", serde_json::to_value(b).unwrap_or_default())),
+        )
+        .chain(bootstrappolicy::namespace_roles().into_iter().map(|r| ("roles", serde_json::to_value(r).unwrap_or_default())))
+        .chain(
+            bootstrappolicy::namespace_role_bindings().into_iter().map(|b| ("rolebindings", serde_json::to_value(b).unwrap_or_default())),
         )
         .collect();
     let mut created = 0;
-    for (plural, obj, fields) in wanted {
+    for (plural, obj) in wanted {
         let info = server.registry.lookup(g, "v1", plural).ok_or_else(|| ApiError::internal(format!("{plural} not registered")))?;
         let name = obj.pointer("/metadata/name").and_then(Value::as_str).unwrap_or("").to_string();
-        match server.storage.get(&info.key("", &name)).await {
-            Err(_) => {
-                ensure(server, g, plural, "", obj).await?;
-                created += 1;
-            }
-            Ok(cur) => {
-                let auto = cur
-                    .pointer(&format!("/metadata/annotations/{}", bootstrappolicy::AUTOUPDATE.replace('/', "~1")))
-                    .and_then(Value::as_str);
+        let ns = obj.pointer("/metadata/namespace").and_then(Value::as_str).unwrap_or("").to_string();
+        let key = info.key(&ns, &name);
+        let Ok(cur) = server.storage.get(&key).await else {
+            ensure(server, g, plural, &ns, obj).await?;
+            created += 1;
+            continue;
+        };
+        let auto =
+            cur.pointer(&format!("/metadata/annotations/{}", bootstrappolicy::AUTOUPDATE.replace('/', "~1"))).and_then(Value::as_str);
+        if auto == Some("false") {
+            continue;
+        }
+        let mut next = cur.clone();
+        if plural == "clusterroles" || plural == "roles" {
+            if obj.get("aggregationRule").is_some_and(|a| !a.is_null()) {
                 // Aggregated roles' rules are owned by the aggregation controller.
-                let fields: Vec<&str> = fields
-                    .iter()
-                    .copied()
-                    .filter(|f| !(*f == "rules" && obj.get("aggregationRule").is_some_and(|a| !a.is_null())))
-                    .collect();
-                if auto != Some("false") {
-                    upsert(server, g, plural, "", obj, &fields).await?;
-                }
+                next["aggregationRule"] = obj["aggregationRule"].clone();
+            } else {
+                union_into(&mut next, &obj, "rules");
             }
+        } else {
+            if cur.get("roleRef") != obj.get("roleRef") {
+                // roleRef is immutable: delete and recreate with the existing subjects added.
+                let mut fresh = obj.clone();
+                union_into(&mut fresh, &cur, "subjects");
+                server.storage.delete(&key, None).await.map_err(|e| ApiError::internal(e.to_string()))?;
+                ensure(server, g, plural, &ns, fresh).await?;
+                continue;
+            }
+            union_into(&mut next, &obj, "subjects");
+        }
+        if next != cur {
+            server.storage.update(&key, None, next).await.map_err(|e| ApiError::internal(e.to_string()))?;
         }
     }
     if created > 0 {
         tracing::info!(created, "created RBAC bootstrap policy");
     }
     Ok(())
+}
+
+/// Appends the entries of `from[field]` that `into[field]` lacks.
+fn union_into(into: &mut Value, from: &Value, field: &str) {
+    let add: Vec<Value> = from.get(field).and_then(Value::as_array).cloned().unwrap_or_default();
+    if add.is_empty() {
+        return;
+    }
+    if !into.get(field).is_some_and(Value::is_array) {
+        into[field] = Value::Array(vec![]);
+    }
+    let list = into[field].as_array_mut().unwrap();
+    for v in add {
+        if !list.contains(&v) {
+            list.push(v);
+        }
+    }
 }
 
 /// Post-start hooks: allocator repair, system namespaces, `kubernetes` service.
@@ -436,4 +574,44 @@ pub async fn bootstrap(server: &Arc<ApiServer>, cfg: &Config) -> Result<(), ApiE
     server.set_ready();
     tracing::info!("bootstrap complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod admission_flag_tests {
+    use super::*;
+
+    #[test]
+    fn admission_plugin_flags() {
+        let v = |x: &[&str]| x.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            enabled_admission_plugins(&[], &[]).unwrap(),
+            vec![
+                "NamespaceLifecycle",
+                "ServiceAccount",
+                "Priority",
+                "DefaultTolerationSeconds",
+                "DefaultStorageClass",
+                "StorageObjectInUseProtection",
+                "CertificateApproval",
+                "CertificateSigning",
+                "CertificateSubjectRestriction"
+            ]
+        );
+        assert_eq!(
+            enabled_admission_plugins(&v(&["NodeRestriction"]), &v(&["Priority"])).unwrap(),
+            vec![
+                "NamespaceLifecycle",
+                "ServiceAccount",
+                "NodeRestriction",
+                "DefaultTolerationSeconds",
+                "DefaultStorageClass",
+                "StorageObjectInUseProtection",
+                "CertificateApproval",
+                "CertificateSigning",
+                "CertificateSubjectRestriction"
+            ]
+        );
+        assert!(enabled_admission_plugins(&v(&["Nope"]), &[]).unwrap_err().contains("enable-admission-plugins plugin \"Nope\" is unknown"));
+        assert!(enabled_admission_plugins(&v(&["Priority"]), &v(&["Priority"])).unwrap_err().contains("overlapped"));
+    }
 }

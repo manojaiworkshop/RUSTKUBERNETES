@@ -33,10 +33,11 @@ use k8s_client_go::{Api, Client, ListParams, PatchType};
 use serde_json::json;
 use tokio::sync::broadcast;
 
-use algorithm::{find_preemption, schedule_pod, Outcome};
+use algorithm::{find_preemption, schedule_pod_with, Outcome};
 use apis::Profile;
 use backend::cache::Cache;
 use backend::queue::{pod_key, QueuedPod, SchedulingQueue};
+use framework::plugins::volumebinding::{self, VolumeBinder};
 
 pub struct Scheduler {
     client: Client,
@@ -49,6 +50,8 @@ pub struct Scheduler {
     /// (uid → (node, pod)); their resources are reserved on that node.
     nominated: std::sync::Mutex<HashMap<String, (String, Arc<Pod>)>>,
     node_inf: Arc<Informer<Node>>,
+    /// Claims/volumes/classes for `VolumeBinding`.
+    volume_binder: Arc<VolumeBinder>,
 }
 
 fn is_assigned(p: &Pod) -> bool {
@@ -72,6 +75,7 @@ impl Scheduler {
         });
         let pod_inf = Informer::new(Api::<Pod>::all(client.clone()), ListParams::default());
         let node_inf = Informer::new(Api::<Node>::all(client.clone()), ListParams::default());
+        let volume_binder = VolumeBinder::new(client.clone());
         Arc::new(Self {
             recorder: EventRecorder::new(client.clone(), "default-scheduler"),
             client,
@@ -81,6 +85,7 @@ impl Scheduler {
             pod_inf,
             node_inf,
             nominated: std::sync::Mutex::new(HashMap::new()),
+            volume_binder,
         })
     }
 
@@ -185,8 +190,13 @@ impl Scheduler {
     pub async fn run(self: Arc<Self>) {
         self.spawn_handler(self.pod_inf.subscribe(), Scheduler::handle_pod);
         self.spawn_handler(self.node_inf.subscribe(), Scheduler::handle_node);
+        // Claim, volume and class changes may make waiting pods schedulable (queueing hints).
+        self.spawn_handler(self.volume_binder.claims.subscribe(), |s, _| s.queue.move_all("PvcChange"));
+        self.spawn_handler(self.volume_binder.volumes.subscribe(), |s, _| s.queue.move_all("PvChange"));
+        self.spawn_handler(self.volume_binder.classes.subscribe(), |s, _| s.queue.move_all("StorageClassChange"));
         self.node_inf.start();
         self.pod_inf.start();
+        self.volume_binder.start().await;
         self.node_inf.wait_synced().await;
         self.pod_inf.wait_synced().await;
         tracing::info!(profiles = ?self.profile_names(), nodes = self.cache.node_count(), "scheduler caches synced");
@@ -218,14 +228,18 @@ impl Scheduler {
         };
         let nodes = self.snapshot_for(&pod);
         let started = std::time::Instant::now();
-        match schedule_pod(&profile, &pod, &nodes) {
+        let mut state = framework::CycleState::new();
+        state.write(volumebinding::BINDER_KEY, self.volume_binder.clone());
+        match schedule_pod_with(&profile, &pod, &nodes, state) {
             Outcome::Scheduled(node) => {
                 let mut assumed = (*pod).clone();
                 assumed.spec.get_or_insert_with(Default::default).node_name = Some(node.clone());
                 self.cache.assume_pod(Arc::new(assumed));
                 tracing::debug!(pod = %key, node = %node, elapsed = ?started.elapsed(), "scheduled");
                 let me = self.clone();
-                tokio::spawn(async move { me.bind(qp, node).await });
+                let binds_volumes = profile.plugins.iter().any(|p| p.name() == volumebinding::NAME);
+                let labels = nodes.iter().find(|n| n.name() == node).map(|n| n.labels()).unwrap_or_default();
+                tokio::spawn(async move { me.bind(qp, node, binds_volumes, labels).await });
             }
             Outcome::Unschedulable(diag) => {
                 let mut msg = diag.message(nodes.len());
@@ -264,9 +278,25 @@ impl Scheduler {
     }
 
     /// `bindingCycle` with the DefaultBinder: `POST pods/<name>/binding`.
-    async fn bind(self: Arc<Self>, qp: QueuedPod, node: String) {
+    async fn bind(
+        self: Arc<Self>,
+        qp: QueuedPod,
+        node: String,
+        binds_volumes: bool,
+        node_labels: std::collections::BTreeMap<String, String>,
+    ) {
         let pod = qp.pod.clone();
         let uid = pod.metadata.uid.clone().unwrap_or_default();
+        // PreBind: VolumeBinding.
+        if binds_volumes {
+            if let Err(e) = self.volume_binder.bind_pod_volumes(&pod, &node, &node_labels).await {
+                self.cache.forget_pod(&uid);
+                tracing::warn!(pod = %qp.key(), "PreBind failed: {e}");
+                self.record_failure(&pod, "SchedulerError", &format!("running PreBind plugin \"VolumeBinding\": {e}")).await;
+                self.queue.add_backoff(qp);
+                return;
+            }
+        }
         let api: Api<Pod> = Api::namespaced(self.client.clone(), pod.metadata.namespace());
         let binding = json!({
             "apiVersion": "v1", "kind": "Binding",

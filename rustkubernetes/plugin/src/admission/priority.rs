@@ -18,8 +18,7 @@ const HIGHEST_USER: i64 = 1_000_000_000;
 pub struct Priority;
 
 async fn classes(ctx: &StrategyContext<'_>) -> Result<Vec<Value>, ApiError> {
-    let (items, _) =
-        ctx.storage.list("/registry/priorityclasses.scheduling.k8s.io/").await.map_err(|e| ApiError::internal(e.to_string()))?;
+    let (items, _) = ctx.storage.list("/registry/priorityclasses/").await.map_err(|e| ApiError::internal(e.to_string()))?;
     Ok(items)
 }
 
@@ -31,7 +30,7 @@ impl AdmissionPlugin for Priority {
 
     async fn admit(&self, attrs: &Attributes<'_>, obj: &mut Value, ctx: &StrategyContext<'_>) -> Result<(), ApiError> {
         let r = attrs.resource;
-        if attrs.operation != Operation::Create || !r.group.is_empty() || r.plural != "pods" {
+        if attrs.operation != Operation::Create || attrs.subresource.is_some() || !r.group.is_empty() || r.plural != "pods" {
             return Ok(());
         }
         let all = classes(ctx).await?;

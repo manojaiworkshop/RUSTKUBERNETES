@@ -11,11 +11,14 @@
 //! | [`validation`] | `pkg/util/validation` (+ `field.ErrorList`)    |
 //! | [`unstructured`]| `pkg/apis/meta/v1/unstructured` helpers       |
 //! | [`quantity`]   | `pkg/api/resource` (Quantity parsing)          |
+//! | [`net`]        | `k8s.io/utils/net` (CIDR parsing)              |
 
+pub mod duration;
 pub mod errors;
 pub mod fields;
 pub mod labels;
 pub mod meta;
+pub mod net;
 pub mod quantity;
 pub mod schema;
 pub mod unstructured;

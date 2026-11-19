@@ -10,7 +10,12 @@
 //! `/registry/<group-resource>/<namespace>/<name>` (or without namespace for
 //! cluster-scoped resources).
 
+#[cfg(test)]
+pub(crate) mod conformance;
+pub mod converting;
+pub mod etcd3;
 pub mod memory;
+pub mod value;
 
 use std::pin::Pin;
 
@@ -77,6 +82,11 @@ pub trait Storage: Send + Sync {
     async fn watch(&self, prefix: &str, from: Revision) -> Result<WatchStream, StorageError>;
 
     fn current_revision(&self) -> Revision;
+
+    /// Health of the backend (`/readyz` check `etcd`).
+    async fn check(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 /// Parses a `resourceVersion` string. Empty → `None`.
